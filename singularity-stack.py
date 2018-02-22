@@ -105,7 +105,7 @@ def _run(app, name, service):
         assert isinstance(service['command'], list)
         cmd += service['command']
     
-    env = service.get('environment', {})
+    env = {k: str(v) for k,v in service.get('environment', {}).items()}
     
     restart_policy = service.get('deploy', {}).get('restart_policy', {})
     if not restart_policy.get('condition', False) in {'on-failure', False}:
