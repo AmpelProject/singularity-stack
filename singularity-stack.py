@@ -10,6 +10,7 @@ import re
 import time
 import subprocess
 import getpass
+import asyncio
 
 def start_order(services):
     """
@@ -140,41 +141,108 @@ def _run(app, name, service):
         stdout.close()
         sys.exit(ret)
 
-def up(app, name, service):
-    instance = _instance_name(app, name)
-    if _instance_running(instance):
-        subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-    image_spec = singularity_command_line(name, service)
-    # raise ValueError(image_spec)
-    subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-    _run(app, name, service)
+def _load_services(args):
+    with open(args.compose_file, 'rb') as f:
+        config = yaml.load(f)
+    version = config.get('version', None)
+    if version != '3':
+        raise ValueError("Unsupported docker-compose version '{}'".format(version))
+    return config.get('services', dict())
 
-def down(app, name, service):
-    instance = _instance_name(app, name)
-    subprocess.check_call(['singularity', 'instance.stop', instance])
+def deploy(args):
+    services = _load_services(args)
+    app = args.name
+    for name in start_order(services):
+        service = services[name]
+        instance = _instance_name(app, name)
+        if _instance_running(instance):
+            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+        image_spec = singularity_command_line(name, service)
+        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+        _run(app, name, service)
+
+def rm(args):
+    services = _load_services(args)
+    app = args.name
+    for name in reversed(list(start_order(services))):
+        instance = _instance_name(app, name)
+        subprocess.check_call(['singularity', 'instance.stop', instance])
+
+def logs(args):
+    async def readline(f):
+        while True:
+            line = f.readline()
+            if line:
+                return line
+            await asyncio.sleep(0.01)
+    
+    async def _tail(app, name, suffix, linetag=''):
+        path = "{}.{}".format(_log_prefix(app, name),suffix)
+        offset = -min((1024, os.stat(path).st_size))
+        with open(path, "rb") as f:
+            # start 1 kB from the end of the file
+            f.seek(offset,2)
+            # consume the partial line
+            f.readline()
+    
+            while True:
+                line = await readline(f)
+                sys.stdout.write(linetag)
+                sys.stdout.write(line.decode())
+    
+    loop = asyncio.get_event_loop()
+    
+    services = _load_services(args)
+    if not args.stderr or args.stdout:
+        args.stderr = True
+        args.stdout = True
+    
+    if args.service is None:
+        names = sorted(services.keys())
+    else:
+        names = [args.service]
+    
+    template = "({{:{}s}} {{:6s}}) ".format(max(map(len, names)))
+    
+    for name in names:
+        if args.stderr:
+            asyncio.ensure_future(_tail(args.name, name, "stderr", template.format(name,"stderr")))
+        if args.stdout:
+            asyncio.ensure_future(_tail(args.name, name, "stdout", template.format(name,"stdout")))
+    
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        return
+    finally:
+        for task in asyncio.Task.all_tasks():
+            task.cancel()
+        loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks(), return_exceptions=True))
+        loop.close()
+
 
 if __name__ == "__main__":
 
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
-    parser.add_argument('command', choices=['deploy', 'rm'])
-    parser.add_argument('name')
     parser.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
+    
+    subparsers = parser.add_subparsers(help='command help')
+    
+    subparsers.add_parser('deploy') \
+        .set_defaults(func=deploy)
+    subparsers.add_parser('rm') \
+        .set_defaults(func=rm)
+    
+    parser_logs = subparsers.add_parser('logs')
+    parser_logs.set_defaults(func=logs)
+    parser_logs.add_argument('-s', '--service', default=None, type=str, help='Dump logs for this service only')
+    parser_logs.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
+    parser_logs.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
+
+    parser.add_argument('name')
+
     opts = parser.parse_args()
-    
-    with open(opts.compose_file, 'rb') as f:
-        config = yaml.load(f)
-    version = config.get('version', None)
-    if version != '3':
-        raise ValueError("Unsupported docker-compose version '{}'".format(version))
-    
-    services = config.get('services', dict())
-    
-    if opts.command == 'deploy':
-        for key in start_order(services):
-            up(opts.name, key, services[key])
-    elif opts.command == 'rm':
-        for key in reversed(list(start_order(services))):
-            down(opts.name, key, services[key])
+    opts.func(opts)
     
 

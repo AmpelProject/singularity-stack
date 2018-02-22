@@ -14,6 +14,7 @@ namely:
 
 - Starting a stack from a configuration stored in a `docker-compose.yml` file, a la `docker stack deploy`
 - Stopping a stack, a la `docker stack rm`
+- Streaming the logs from a stack's services to the console
 
 This makes it possible to maintain only one workflow based on Docker, and
 deploy it on Docker with commercial providers or with Singularity with academic
