@@ -107,7 +107,7 @@ def _run(app, name, service):
     env = service.get('environment', {})
     
     restart_policy = service.get('deploy', {}).get('restart_policy', {})
-    if not restart_policy.get('condition','no') in {'on-failure', 'no'}:
+    if not restart_policy.get('condition', False) in {'on-failure', False}:
         raise ValueError("unsupported restart condition '{}'".format(restart_policy['condition']))
     
     max_attempts = 0
