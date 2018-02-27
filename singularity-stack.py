@@ -10,6 +10,7 @@ import re
 import time
 import subprocess
 import getpass
+import tempfile
 import asyncio
 
 def start_order(services):
@@ -58,6 +59,15 @@ def singularity_command_line(name, service):
     cmd = ['--contain']
     for volume in service.get('volumes', []):
         cmd += ['-B', volume]
+    
+    assert '_tempfiles' not in service
+    service['_tempfiles'] = list()
+    if 'extra_hosts' in service:
+        with tempfile.NamedTemporaryFile(mode='wt', delete=False) as hosts:
+            service['_tempfiles'].append(hosts)
+            for entry in service['extra_hosts']:
+                hosts.write('{1}\t{0}\n'.format(*entry.split(':')))
+        cmd += ['-B', '{}:/etc/hosts'.format(hosts.name)]
     
     cmd.append(singularity_image(service['image']))
     
@@ -139,6 +149,9 @@ def _run(app, name, service):
             log('exited cleanly\n')
         stderr.close()
         stdout.close()
+        for temp in service.get('_tempfiles', []):
+            temp.close()
+            os.unlink(temp.name)
         sys.exit(ret)
 
 def _load_services(args):
