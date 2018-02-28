@@ -48,6 +48,7 @@ parsed, and only the following keys are used:
 - `environment`
 - `depends_on`
 - `volumes`
+- `extra_hosts`
 - `deploy`
   * `restart_policy`
     - `condition`: only 'no' and 'on-failure' are recognized
