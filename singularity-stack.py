@@ -233,9 +233,7 @@ def logs(args):
         loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks(), return_exceptions=True))
         loop.close()
 
-
-if __name__ == "__main__":
-
+def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
@@ -257,5 +255,7 @@ if __name__ == "__main__":
 
     opts = parser.parse_args()
     opts.func(opts)
-    
+
+if __name__ == "__main__":
+    main()
 
