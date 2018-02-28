@@ -5,6 +5,7 @@ Deploy a Docker application with Singularity, in a manner similar to `docker-sta
 """
 
 import yaml
+import daemon
 import sys, os
 import re
 import time
@@ -126,29 +127,28 @@ def _run(app, name, service):
         max_attempts = restart_policy.get('max_attempts', sys.maxsize)
     delay = _parse_duration(restart_policy.get('delay', ''))
     
+    if os.fork() != 0:
+        return
+    
     stderr = open(_log_prefix(app, name)+".stderr", "wb")
     stdout = open(_log_prefix(app, name)+".stdout", "wb")
     
-    log = lambda s: stderr.write((s+'\n').encode('utf-8'))
-    
-    if os.fork() == 0:
+    with daemon.DaemonContext(detach_process=True, stderr=stderr, stdout=stdout):
         ret = 0
         for _ in range(-1, max_attempts):
             if not _instance_running(instance):
-                log('{} instance is gone!'.format(instance))
+                print('{} instance is gone!'.format(instance))
                 sys.exit(1)
             ret = subprocess.call(cmd, env=env, stdout=stdout, stderr=stderr)
             if ret == 0:
                 break
             else:
-                log('sleeping {} before restart')
+                print('sleeping {} before restart'.format(delay))
                 time.sleep(delay)
         if ret != 0:
-            log('failed permanently\n')
+            print('failed permanently\n')
         else:
-            log('exited cleanly\n')
-        stderr.close()
-        stdout.close()
+            print('exited cleanly\n')
         for temp in service.get('_tempfiles', []):
             temp.close()
             os.unlink(temp.name)
