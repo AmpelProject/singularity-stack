@@ -6,7 +6,7 @@ Deploy a Docker application with Singularity, in a manner similar to `docker-sta
 
 import yaml
 import daemon
-import sys, os
+import sys, os, stat
 import re
 import time
 import subprocess
@@ -58,9 +58,12 @@ def singularity_command_line(name, service):
     if not 'image' in service:
         raise ValueError("service '{}' is missing an 'image' key".format(name))
     cmd = ['--contain']
+    
+    # Mount volumes
     for volume in service.get('volumes', []):
         cmd += ['-B', volume]
     
+    # Fill and bind /etc/hosts file
     assert '_tempfiles' not in service
     service['_tempfiles'] = list()
     if 'extra_hosts' in service:
@@ -69,6 +72,14 @@ def singularity_command_line(name, service):
             for entry in service['extra_hosts']:
                 hosts.write('{1}\t{0}\n'.format(*entry.split(':')))
         cmd += ['-B', '{}:/etc/hosts'.format(hosts.name)]
+    
+    # Bind secrets files
+    # NB: unlike Docker, these are not encrypted at rest.
+    for secret in service.get('secrets', list()):
+        perms = os.stat(secret).st_mode
+        if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
+            raise ValueError("Secrets file '{}' should be readable only by its owner")
+        cmd += ['-B', '{}:/run/secrets/{}'.format(secret, os.path.basename(secret))]
     
     cmd.append(singularity_image(service['image']))
     
