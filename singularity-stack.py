@@ -14,6 +14,8 @@ import getpass
 import tempfile
 import asyncio
 
+__version__ = "0.1"
+
 def start_order(services):
     """
     Yield names of services in the order that they need to be started to
@@ -246,7 +248,8 @@ def logs(args):
 
 def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
-    parser = ArgumentParser(description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
+    parser = ArgumentParser(prog='singularity-stack', description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
+    parser.add_argument('--version', action='version', version='singularity-stack {}'.format(__version__))
     parser.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
     
     subparsers = parser.add_subparsers(help='command help')
