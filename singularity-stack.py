@@ -6,7 +6,8 @@ Deploy a Docker application with Singularity, in a manner similar to `docker-sta
 
 import yaml
 import daemon
-import sys, os, stat
+import sys, os, stat, shutil
+import warnings
 import re
 import time
 import subprocess
@@ -48,40 +49,75 @@ def singularity_image(name):
         subprocess.check_call(['singularity', 'pull', 'docker://{}'.format(name)], cwd=cwd)
     return image_path
 
-def singularity_command_line(name, service):
+def _bind_secret(name, config):
+    if not name in config.get('secrets', dict()):
+        raise ValueError("Secret '{}' not defined in configuration".format(name))
+    secret = config['secrets'][name]['file']
+    perms = os.stat(secret).st_mode
+    if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
+        raise ValueError("Secrets file '{}' should be readable only by its owner")
+    return['-B', '{}:/run/secrets/{}'.format(secret, name)]
+
+def singularity_command_line(name, config):
     """
     Start a Singularity instance from the given Docker service definition
     """
     # TODO:
-    # tmpfs
     # entrypoint
     # ports
     # expose
+    service = config['services'][name]
     if not 'image' in service:
         raise ValueError("service '{}' is missing an 'image' key".format(name))
     cmd = ['--contain']
     
-    # Mount volumes
-    for volume in service.get('volumes', []):
-        cmd += ['-B', volume]
-    
-    # Fill and bind /etc/hosts file
     assert '_tempfiles' not in service
     service['_tempfiles'] = list()
-    if 'extra_hosts' in service:
-        with tempfile.NamedTemporaryFile(mode='wt', delete=False) as hosts:
-            service['_tempfiles'].append(hosts)
-            for entry in service['extra_hosts']:
-                hosts.write('{1}\t{0}\n'.format(*entry.split(':')))
-        cmd += ['-B', '{}:/etc/hosts'.format(hosts.name)]
+    
+    # Mount volumes
+    for volume in service.get('volumes', []):
+        if isinstance(volume, str):
+            if ':' in volume:
+                source, dest = volume.split(':')
+            else:
+                source, dest = volume, volume
+            if source.startswith('.') or source.startswith('/'):
+                voltype = 'bind'
+            else:
+                voltype = 'volume'
+            volume = dict(type=voltype, source=source, target=dest)
+            
+        if isinstance(volume, dict):
+            if volume['type'] == 'volume':
+                warnings.warn("Volume '{}' will be treated as a bind mount".format(volume['source']))
+                if not os.path.isdir(volume['source']):
+                    raise ValueError("Volume source path '{}' does not exist".format(volume['source']))
+                cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
+            elif volume['type'] == 'tmpfs':
+                tempdir = tempfile.mkdtemp(dir='/dev/shm/')
+                service['_tempfiles'].append(tempdir)
+                cmd += ['-B', '{}:{}'.format(tempdir, volume['target'])]
+            elif volume['type'] == 'bind':
+                cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
+            else:
+                raise ValueError("Unsupported volume type '{}'".format(volume['type']))
+    
+    # Fill and bind /etc/hosts file
+    with tempfile.NamedTemporaryFile(mode='wt', delete=False) as hosts:
+        service['_tempfiles'].append(hosts)
+        for entry in service.get('extra_hosts', list()):
+            hosts.write('{1}\t{0}\n'.format(*entry.split(':')))
+        # Alias the names of all services in the stack to localhost
+        # TODO: support placement on other nodes and/or future Singularity
+        #       network isolation
+        for entry in config['services']:
+            hosts.write('{1}\t{0}\n'.format(entry, '127.0.0.1'))
+    cmd += ['-B', '{}:/etc/hosts'.format(hosts.name)]
     
     # Bind secrets files
     # NB: unlike Docker, these are not encrypted at rest.
     for secret in service.get('secrets', list()):
-        perms = os.stat(secret).st_mode
-        if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
-            raise ValueError("Secrets file '{}' should be readable only by its owner")
-        cmd += ['-B', '{}:/run/secrets/{}'.format(secret, os.path.basename(secret))]
+        cmd += _bind_secret(secret, config)
     
     cmd.append(singularity_image(service['image']))
     
@@ -163,8 +199,14 @@ def _run(app, name, service):
         else:
             print('exited cleanly\n')
         for temp in service.get('_tempfiles', []):
-            temp.close()
-            os.unlink(temp.name)
+            if hasattr(temp, 'name'):
+                temp = getattr(temp, 'name')
+            print('removing {}'.format(temp))
+            if os.path.isdir(temp):
+                shutil.rmtree(temp)
+            else:
+                os.unlink(temp)
+                
         sys.exit(ret)
 
 def _load_services(args):
@@ -173,24 +215,24 @@ def _load_services(args):
     version = float(config.get('version', 0))
     if version < 3:
         raise ValueError("Unsupported docker-compose version '{}'".format(version))
-    return config.get('services', dict())
+    return config
 
 def deploy(args):
-    services = _load_services(args)
+    config = _load_services(args)
     app = args.name
-    for name in start_order(services):
-        service = services[name]
+    for name in start_order(config['services']):
+        service = config['services'][name]
         instance = _instance_name(app, name)
         if _instance_running(instance):
             subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-        image_spec = singularity_command_line(name, service)
+        image_spec = singularity_command_line(name, config)
         subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-        _run(app, name, service)
+        _run(app, name, config['services'][name])
 
 def rm(args):
-    services = _load_services(args)
+    config = _load_services(args)
     app = args.name
-    for name in reversed(list(start_order(services))):
+    for name in reversed(list(start_order(config['services']))):
         instance = _instance_name(app, name)
         subprocess.check_call(['singularity', 'instance.stop', instance])
 
