@@ -15,7 +15,7 @@ import getpass
 import tempfile
 import asyncio
 
-__version__ = "0.1"
+__version__ = "0.2"
 
 def start_order(services):
     """
