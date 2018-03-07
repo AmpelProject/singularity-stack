@@ -170,8 +170,8 @@ def _run(app, name, service):
 def _load_services(args):
     with open(args.compose_file, 'rb') as f:
         config = yaml.load(f)
-    version = config.get('version', None)
-    if version != '3':
+    version = float(config.get('version', 0))
+    if version < 3:
         raise ValueError("Unsupported docker-compose version '{}'".format(version))
     return config.get('services', dict())
 
