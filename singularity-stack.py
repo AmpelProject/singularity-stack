@@ -41,7 +41,8 @@ def singularity_image(name):
     if '/' in name:
         _, basename = name.split('/')
     if ':' in basename:
-        basename, _ = name.split(':')
+        basename, tag = basename.split(':')
+        basename += '-{}'.format(tag)
     
     cwd = os.environ.get('SINGULARITY_CACHEDIR', os.getcwd())
     image_path = os.path.join(cwd, basename+'.simg')
