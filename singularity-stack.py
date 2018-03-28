@@ -71,7 +71,7 @@ def singularity_command_line(name, config):
     if not 'image' in service:
         raise ValueError("service '{}' is missing an 'image' key".format(name))
     cmd = ['--contain']
-    
+
     assert '_tempfiles' not in service
     service['_tempfiles'] = list()
     
@@ -228,6 +228,8 @@ def deploy(args):
             if _instance_running(instance):
                 subprocess.check_call(['singularity', 'instance.stop'] + [instance])
             image_spec = singularity_command_line(name, config)
+            if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
+                raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
             subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
             _run(app, name, config['services'][name])
     except:
