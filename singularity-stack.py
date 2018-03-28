@@ -220,21 +220,29 @@ def _load_services(args):
 def deploy(args):
     config = _load_services(args)
     app = args.name
-    for name in start_order(config['services']):
-        service = config['services'][name]
-        instance = _instance_name(app, name)
-        if _instance_running(instance):
-            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-        image_spec = singularity_command_line(name, config)
-        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-        _run(app, name, config['services'][name])
+    try:
+        for name in start_order(config['services']):
+            service = config['services'][name]
+            instance = _instance_name(app, name)
+            if _instance_running(instance):
+                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+            image_spec = singularity_command_line(name, config)
+            subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+            _run(app, name, config['services'][name])
+    except:
+        for name in reversed(list(start_order(config['services']))):
+            instance = _instance_name(app, name)
+            if _instance_running(instance):
+                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+        raise
 
 def rm(args):
     config = _load_services(args)
     app = args.name
     for name in reversed(list(start_order(config['services']))):
         instance = _instance_name(app, name)
-        subprocess.check_call(['singularity', 'instance.stop', instance])
+        if _instance_running(instance):
+            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
 
 def logs(args):
     async def readline(f):
