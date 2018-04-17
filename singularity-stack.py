@@ -50,6 +50,8 @@ def singularity_image(name):
         subprocess.check_call(['singularity', 'pull', 'docker://{}'.format(name)], cwd=cwd)
     return image_path
 
+overlayfs_is_broken = True
+
 def _bind_secret(name, config):
     if not name in config.get('secrets', dict()):
         raise ValueError("Secret '{}' not defined in configuration".format(name))
@@ -57,7 +59,28 @@ def _bind_secret(name, config):
     perms = os.stat(secret).st_mode
     if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
         raise ValueError("Secrets file '{}' should be readable only by its owner")
-    return['-B', '{}:/run/secrets/{}'.format(secret, name)]
+    if overlayfs_is_broken:
+        return []
+    else:
+        return ['-B', '{}:/run/secrets/{}'.format(secret, name)]
+
+def _env_secrets(env, config):
+    """
+    Overlay mounts may not be available due to EGI-SVG-2018-14213. Find
+    idiomatic uses of secrets files and place the contents in the
+    environment.
+    """
+    if overlayfs_is_broken:
+        prefix = '/run/secrets/'
+        postfix = '_FILE'
+        for k in list(env.keys()):
+            if k.endswith(postfix) and env[k].startswith(prefix):
+                path = env[k]
+                name = path[len(prefix):]
+                secret = config['secrets'][name]['file']
+                del env[k]
+                with open(secret) as f:
+                    env[k[:-len(postfix)]] = f.read().strip()
 
 def singularity_command_line(name, config):
     """
@@ -150,12 +173,13 @@ def _instance_running(name):
         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret == 0
 
-def _run(app, name, service):
+def _run(app, name, config):
     """
     Fork a daemon process that starts the service process in a Singularity
     instance, redirects its stdout/stderr to files, and restarts it on failure
     according to the given `restart_policy`
     """
+    service = config['services'][name]
     if 'restart' in service:
         raise ValueError("restart is not supported. use deploy instead")
     instance = _instance_name(app, name)
@@ -167,6 +191,8 @@ def _run(app, name, service):
         cmd += service['command']
     
     env = {k: str(v) for k,v in service.get('environment', {}).items()}
+    if overlayfs_is_broken:
+        _env_secrets(env, config)
     
     restart_policy = service.get('deploy', {}).get('restart_policy', {})
     if not restart_policy.get('condition', False) in {'on-failure', False}:
@@ -231,7 +257,7 @@ def deploy(args):
             if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
                 raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
             subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-            _run(app, name, config['services'][name])
+            _run(app, name, config)
     except:
         for name in reversed(list(start_order(config['services']))):
             instance = _instance_name(app, name)
