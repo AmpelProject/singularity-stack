@@ -258,12 +258,13 @@ def deploy(args):
                 raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
             subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
             _run(app, name, config)
-    except:
+    except Exception as e:
+        print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
             instance = _instance_name(app, name)
             if _instance_running(instance):
                 subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-        raise
+        raise e
 
 def rm(args):
     config = _load_services(args)
