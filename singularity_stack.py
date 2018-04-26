@@ -14,6 +14,7 @@ import subprocess
 import getpass
 import tempfile
 import asyncio
+import pathlib
 
 __version__ = "0.2"
 
@@ -82,6 +83,17 @@ def _env_secrets(env, config):
                 with open(secret) as f:
                     env[k[:-len(postfix)]] = f.read().strip()
 
+def _init_volume(image, source, target):
+    """
+    Initialize a host directory with the contents of a container path
+    """
+    pathlib.Path(source).parent.mkdir(parents=True, exist_ok=True)
+    tagfile = os.path.join(source, ".singularity-stack-volume")
+    if not os.path.exists(tagfile):
+        cmd = "cp -r '{}' '{}'".format("/var/singularity/mnt/final/"+target, source)
+        subprocess.check_call(["singularity", "mount", image, "sh", "-c", cmd])
+        open(tagfile, 'w').close()
+
 def singularity_command_line(name, config):
     """
     Start a Singularity instance from the given Docker service definition
@@ -105,7 +117,7 @@ def singularity_command_line(name, config):
                 source, dest = volume.split(':')
             else:
                 source, dest = volume, volume
-            if source.startswith('.') or source.startswith('/'):
+            if source.startswith('.') or source.startswith('/') and ':' in volume:
                 voltype = 'bind'
             else:
                 voltype = 'volume'
@@ -113,9 +125,7 @@ def singularity_command_line(name, config):
             
         if isinstance(volume, dict):
             if volume['type'] == 'volume':
-                warnings.warn("Volume '{}' will be treated as a bind mount".format(volume['source']))
-                if not os.path.isdir(volume['source']):
-                    raise ValueError("Volume source path '{}' does not exist".format(volume['source']))
+                _init_volume(singularity_image(service['image']), volume['source'], volume['target'])
                 cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
             elif volume['type'] == 'tmpfs':
                 tempdir = tempfile.mkdtemp(dir='/dev/shm/')
