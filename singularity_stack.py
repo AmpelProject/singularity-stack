@@ -290,42 +290,68 @@ def _transform_items(collection, transform):
     else:
         return transform(collection)
 
-def _load_services(args):
-    if args.func == deploy:
-        with open(args.compose_file, 'rb') as f:
+import fcntl
+import copy
+class StackCache(dict):
+    cache_file = "/var/tmp/{}.singularity-stack.yml".format(getpass.getuser())
+
+    @classmethod
+    def load(cls):
+        with open(cls.cache_file, "r") as fd:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH)
+                stacks = yaml.load(fd)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        return stacks
+
+    def __init__(self):
+        try:
+            self.fd = open(self.cache_file, "r+")
+        except FileNotFoundError:
+            self.fd = open(self.cache_file, "a+")
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+            contents = yaml.load(self.fd)
+            if contents is None:
+                contents = {}
+            super(StackCache, self).__init__(contents)
+        except:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            raise
+
+    def add(self, name, compose_file):
+        with open(compose_file, 'rb') as f:
             config = _transform_items(yaml.load(f), expandvars)
         version = float(config.get('version', 0))
         if version < 3:
             raise ValueError("Unsupported docker-compose version '{}'".format(version))
-    else:
-        config = _load_stacks()[args.name]
-       
-    return config
+        self[name] = copy.deepcopy(config)
+        return config
 
-#import fnctl
+    def __del__(self):
+        try:
+            self.fd.truncate(0)
+            if len(self) > 0:
+                self.fd.seek(0, 0)
+                yaml.dump(dict(self.items()), self.fd)
+        finally:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
 
-def _load_stacks():
-    cache_file = "/var/tmp/{}.singularity-stack.yml".format(getpass.getuser())
-    try:
-        with open(cache_file, 'rb') as f:
-            cache = yaml.load(f)
-    except FileNotFoundError:
-        cache = dict()
-    return cache
+def list_stacks(args):
+    stacks = StackCache.load()
+    template = '{:30s} {:30s}'
+    print(template.format('Stack', 'Services'))
+    print(template.format('='*30, '='*30))
+    for name, config in stacks.items():
+        for i, service in enumerate(config['services'].keys()):
+            print(template.format(name if i==0 else '', service))
+        print(template.format('-'*30, '-'*30))
 
-def _save_stacks(cache):
-    cache_file = "/var/tmp/{}.singularity-stack.yml".format(getpass.getuser())
-    with open(cache_file, 'w') as f:
-        yaml.dump(cache, f)
-
-def show(args):
-    config = _load_services(args)
-    print(yaml.dump(config))
-
-import copy
 def deploy(args):
-    config = _load_services(args)
-    frozen_config = copy.deepcopy(config)
+    stacks = StackCache()
+    config = stacks.add(args.name, args.compose_file)
     app = args.name
     try:
         for name in start_order(config['services']):
@@ -345,20 +371,16 @@ def deploy(args):
             if _instance_running(instance):
                 subprocess.check_call(['singularity', 'instance.stop'] + [instance])
         raise e
-    stacks = _load_stacks()
-    stacks[app] = frozen_config
-    _save_stacks(stacks)
 
 def rm(args):
-    config = _load_services(args)
+    stacks = StackCache()
     app = args.name
+    config = stacks[app]
     for name in reversed(list(start_order(config['services']))):
         instance = _instance_name(app, name)
         if _instance_running(instance):
             subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-    stacks = _load_stacks()
     del stacks[app]
-    _save_stacks(stacks)
 
 def logs(args):
     async def readline(f):
@@ -384,7 +406,7 @@ def logs(args):
     
     loop = asyncio.get_event_loop()
     
-    services = _load_services(args)
+    services = StackCache.load()[args.name]
     if not args.stderr or args.stdout:
         args.stderr = True
         args.stdout = True
@@ -416,24 +438,28 @@ def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(prog='singularity-stack', description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('--version', action='version', version='singularity-stack {}'.format(__version__))
-    parser.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
     
     subparsers = parser.add_subparsers(help='command help')
-    
-    subparsers.add_parser('show') \
-        .set_defaults(func=show)
-    subparsers.add_parser('deploy') \
-        .set_defaults(func=deploy)
-    subparsers.add_parser('rm') \
-        .set_defaults(func=rm)
-    
-    parser_logs = subparsers.add_parser('logs')
-    parser_logs.set_defaults(func=logs)
-    parser_logs.add_argument('-s', '--service', default=None, type=str, help='Dump logs for this service only')
-    parser_logs.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
-    parser_logs.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
 
-    parser.add_argument('name')
+    def add_command(f, name=None, needs_name=True):
+        if name is None:
+            name = f.__name__
+        p = subparsers.add_parser(name)
+        p.set_defaults(func=f)
+        if needs_name:
+            p.add_argument('name', help="name of stack (argument passed to `singularity-stack deploy`")
+        return p
+
+    add_command(list_stacks, 'list', False)
+    p = add_command(deploy)
+    p.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
+
+    p = add_command(rm)
+
+    p = add_command(logs)
+    p.add_argument('-s', '--service', default=None, type=str, help='Dump logs for this service only')
+    p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
+    p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
 
     opts = parser.parse_args()
     opts.func(opts)
