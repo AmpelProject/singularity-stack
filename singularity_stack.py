@@ -16,7 +16,7 @@ import tempfile
 import asyncio
 import pathlib
 
-__version__ = "0.2"
+__version__ = "0.2.1"
 
 def start_order(services):
     """
@@ -246,13 +246,61 @@ def _run(app, name, config):
                 
         sys.exit(ret)
 
+import re
+def expandvars(path, environ=os.environ):
+    """Expand shell variables of form $var and ${var}.  Unknown variables
+    raise and error. Adapted from os.posixpath.expandvars"""
+    if not isinstance(path, str):
+        return path
+    if '$' not in path:
+        return path
+    _varprog = re.compile(r'\$(\w+|\{[^}]*\})', re.ASCII)
+    search = _varprog.search
+    start = '{'
+    end = '}'
+    i = 0
+    while True:
+        m = search(path, i)
+        if not m:
+            break
+        i, j = m.span(0)
+        name = m.group(1)
+        if name.startswith(start) and name.endswith(end):
+            name = name[1:-1]
+        try:
+            value = environ[name]
+        except KeyError:
+            i = j
+            raise
+        else:
+            tail = path[j:]
+            path = path[:i] + value
+            i = len(path)
+            path += tail
+    return expandvars(path, environ)
+
+def _transform_items(collection, transform):
+    if isinstance(collection, list):
+        return [_transform_items(c, transform) for c in collection]
+    elif isinstance(collection, dict):
+        result = {}
+        for k,v in collection.items():
+            result[k] = _transform_items(v, transform)
+        return result
+    else:
+        return transform(collection)
+
 def _load_services(args):
     with open(args.compose_file, 'rb') as f:
-        config = yaml.load(f)
+        config = _transform_items(yaml.load(f), expandvars)
     version = float(config.get('version', 0))
     if version < 3:
         raise ValueError("Unsupported docker-compose version '{}'".format(version))
     return config
+
+def show(args):
+    config = _load_services(args)
+    print(yaml.dump(config))
 
 def deploy(args):
     config = _load_services(args)
@@ -344,6 +392,8 @@ def main():
     
     subparsers = parser.add_subparsers(help='command help')
     
+    subparsers.add_parser('show') \
+        .set_defaults(func=show)
     subparsers.add_parser('deploy') \
         .set_defaults(func=deploy)
     subparsers.add_parser('rm') \
