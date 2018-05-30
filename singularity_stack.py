@@ -291,19 +291,41 @@ def _transform_items(collection, transform):
         return transform(collection)
 
 def _load_services(args):
-    with open(args.compose_file, 'rb') as f:
-        config = _transform_items(yaml.load(f), expandvars)
-    version = float(config.get('version', 0))
-    if version < 3:
-        raise ValueError("Unsupported docker-compose version '{}'".format(version))
+    if args.func == deploy:
+        with open(args.compose_file, 'rb') as f:
+            config = _transform_items(yaml.load(f), expandvars)
+        version = float(config.get('version', 0))
+        if version < 3:
+            raise ValueError("Unsupported docker-compose version '{}'".format(version))
+    else:
+        config = _load_stacks()[args.name]
+       
     return config
+
+#import fnctl
+
+def _load_stacks():
+    cache_file = "/var/tmp/{}.singularity-stack.yml".format(getpass.getuser())
+    try:
+        with open(cache_file, 'rb') as f:
+            cache = yaml.load(f)
+    except FileNotFoundError:
+        cache = dict()
+    return cache
+
+def _save_stacks(cache):
+    cache_file = "/var/tmp/{}.singularity-stack.yml".format(getpass.getuser())
+    with open(cache_file, 'w') as f:
+        yaml.dump(cache, f)
 
 def show(args):
     config = _load_services(args)
     print(yaml.dump(config))
 
+import copy
 def deploy(args):
     config = _load_services(args)
+    frozen_config = copy.deepcopy(config)
     app = args.name
     try:
         for name in start_order(config['services']):
@@ -323,6 +345,9 @@ def deploy(args):
             if _instance_running(instance):
                 subprocess.check_call(['singularity', 'instance.stop'] + [instance])
         raise e
+    stacks = _load_stacks()
+    stacks[app] = frozen_config
+    _save_stacks(stacks)
 
 def rm(args):
     config = _load_services(args)
@@ -331,6 +356,9 @@ def rm(args):
         instance = _instance_name(app, name)
         if _instance_running(instance):
             subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+    stacks = _load_stacks()
+    del stacks[app]
+    _save_stacks(stacks)
 
 def logs(args):
     async def readline(f):
