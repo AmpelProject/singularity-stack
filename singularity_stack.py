@@ -171,8 +171,9 @@ def _parse_duration(duration):
         raise ValueError("duration '{}' could not be parsed".format(duration))
     return dt
 
+import hashlib
 def _instance_name(*args):
-    return '.'.join(args)
+    return hashlib.sha1('.'.join(args).encode()).hexdigest()[:8]
 
 def _log_prefix(*args):
     return "/var/tmp/{}.singularity.{}".format(getpass.getuser(), _instance_name(*args))
