@@ -391,59 +391,78 @@ def rm(args):
         instance = _instance_name(app, name)
         if _instance_running(instance):
             subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-    del stacks[app]
+    stacks.remove(app)
 
 def logs(args):
-    async def readline(f):
-        while True:
-            line = f.readline()
-            if line:
-                return line
-            await asyncio.sleep(0.01)
-    
-    async def _tail(app, name, suffix, linetag=''):
+    from threading import Thread, Event, Semaphore
+    import threading
+    from queue import Queue, Empty
+
+    queue = Queue(64)
+    stop = Event()
+    def _tail(queue, counter, app, follow, name, suffix, linetag=''):
         path = "{}.{}".format(_log_prefix(app, name),suffix)
-        offset = -min((1024, os.stat(path).st_size))
         with open(path, "rb") as f:
-            # start 1 kB from the end of the file
-            f.seek(offset,2)
+            size = os.stat(path).st_size
+            if follow:
+                # start 1 kB from the end of the file
+                offset = -min((1024, size))
+                f.seek(offset,2)
             # consume the partial line
             f.readline()
-    
-            while True:
-                line = await readline(f)
-                sys.stdout.write(linetag)
-                sys.stdout.write(line.decode())
-    
-    loop = asyncio.get_event_loop()
-    
-    services = StackCache.load()[args.name]
+
+            while not stop.is_set():
+                line = f.readline()
+                if len(line) == 0:
+                    if follow:
+                        continue
+                    else:
+                        break
+                queue.put((linetag, line.decode()))
+                time.sleep(0.01)
+        counter.count -= 1
+
+    config = StackCache.load()[args.name]
     if not args.stderr or args.stdout:
         args.stderr = True
         args.stdout = True
     
     if args.service is None:
-        names = sorted(services.keys())
+        names = sorted(config['services'].keys())
     else:
         names = [args.service]
     
     template = "({{:{}s}} {{:6s}}) ".format(max(map(len, names)))
     
+    threads = []
+    class counter(object):
+        def __init__(self):
+            self.count = 0
+    thread_count = counter()
     for name in names:
         if args.stderr:
-            asyncio.ensure_future(_tail(args.name, name, "stderr", template.format(name,"stderr")))
+            threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, "stderr", template.format(name,"stderr"))))
         if args.stdout:
-            asyncio.ensure_future(_tail(args.name, name, "stdout", template.format(name,"stdout")))
-    
+            threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, "stdout", template.format(name,"stdout"))))
+    for t in threads:
+        thread_count.count += 1
+        t.start()
     try:
-        loop.run_forever()
+        while thread_count.count > 0:
+            try:
+                tag, line = queue.get(timeout=0.1)
+            except Empty:
+                continue
+            sys.stdout.write(tag)
+            sys.stdout.write(line)
     except KeyboardInterrupt:
-        return
+        pass
     finally:
-        for task in asyncio.Task.all_tasks():
-            task.cancel()
-        loop.run_until_complete(asyncio.gather(*asyncio.Task.all_tasks(), return_exceptions=True))
-        loop.close()
+        stop.set()
+
+    for t in threads:
+        t.join()
+    
 
 def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
@@ -463,12 +482,13 @@ def main():
 
     add_command(list_stacks, 'list', False)
     p = add_command(deploy)
-    p.add_argument('-c', '--compose-file', type=str, default='docker-compose.yml')
+    p.add_argument('-c', '--compose-file', type=str, default=None)
 
     p = add_command(rm)
 
     p = add_command(logs)
-    p.add_argument('-s', '--service', default=None, type=str, help='Dump logs for this service only')
+    p.add_argument('service', default=None, nargs='?', type=str, help='Dump logs for this service only')
+    p.add_argument('-f', '--follow', default=False, action="store_true", help='Follow log output')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
 
