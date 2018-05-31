@@ -321,14 +321,21 @@ class StackCache(dict):
             fcntl.flock(self.fd, fcntl.LOCK_UN)
             raise
 
-    def add(self, name, compose_file):
+    def add(self, name, compose_file=None):
+        if compose_file is None:
+            self[name]['active'] = True
+            return copy.deepcopy(self[name])
         with open(compose_file, 'rb') as f:
             config = _transform_items(yaml.load(f), expandvars)
         version = float(config.get('version', 0))
         if version < 3:
             raise ValueError("Unsupported docker-compose version '{}'".format(version))
         self[name] = copy.deepcopy(config)
+        self[name]['active'] = True
         return config
+
+    def remove(self, name):
+        self[name]['active'] = False
 
     def __del__(self):
         try:
@@ -346,6 +353,8 @@ def list_stacks(args):
     print(template.format('Stack', 'Services'))
     print(template.format('='*30, '='*30))
     for name, config in stacks.items():
+        if not config.get('active', False):
+            continue
         for i, service in enumerate(config['services'].keys()):
             print(template.format(name if i==0 else '', service))
         print(template.format('-'*30, '-'*30))
@@ -353,6 +362,7 @@ def list_stacks(args):
 def deploy(args):
     stacks = StackCache()
     config = stacks.add(args.name, args.compose_file)
+    del stacks
     app = args.name
     try:
         for name in start_order(config['services']):
