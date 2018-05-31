@@ -233,7 +233,7 @@ def _run(app, name, config):
                 print('sleeping {} before restart'.format(delay))
                 time.sleep(delay)
         if ret != 0:
-            print('failed permanently\n')
+            print('failed permanently with status {}\n'.format(ret))
         else:
             print('exited cleanly\n')
         for temp in service.get('_tempfiles', []):
