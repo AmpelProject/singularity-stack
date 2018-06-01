@@ -212,11 +212,11 @@ def _run(app, name, replica, config):
         _env_secrets(env, config)
     
     restart_policy = service.get('deploy', {}).get('restart_policy', {})
-    if not restart_policy.get('condition', False) in {'on-failure', False}:
+    if not restart_policy.get('condition', False) in {'on-failure', 'any', False}:
         raise ValueError("unsupported restart condition '{}'".format(restart_policy['condition']))
     
     max_attempts = 0
-    if restart_policy.get('condition','no') == 'on-failure':
+    if restart_policy.get('condition','no') in {'on-failure', 'any'}:
         max_attempts = restart_policy.get('max_attempts', sys.maxsize)
     delay = _parse_duration(restart_policy.get('delay', ''))
     
@@ -233,7 +233,7 @@ def _run(app, name, replica, config):
                 print('{} instance is gone!'.format(instance))
                 sys.exit(1)
             ret = subprocess.call(cmd, env=env, stdout=stdout, stderr=stderr)
-            if ret == 0:
+            if ret == 0 and restart_policy.get('condition', 'no') != 'any':
                 break
             else:
                 print('sleeping {} before restart'.format(delay))
