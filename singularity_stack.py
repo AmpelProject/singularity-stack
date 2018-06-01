@@ -179,7 +179,7 @@ def _parse_duration(duration):
 
 import hashlib
 def _instance_name(*args):
-    return hashlib.sha1('.'.join(args).encode()).hexdigest()[:8]
+    return hashlib.sha1('.'.join(map(str,args)).encode()).hexdigest()[:8]
 
 def _log_prefix(*args):
     return "/var/tmp/{}.singularity.{}".format(getpass.getuser(), _instance_name(*args))
@@ -190,7 +190,7 @@ def _instance_running(name):
         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret == 0
 
-def _run(app, name, config):
+def _run(app, name, replica, config):
     """
     Fork a daemon process that starts the service process in a Singularity
     instance, redirects its stdout/stderr to files, and restarts it on failure
@@ -199,7 +199,7 @@ def _run(app, name, config):
     service = config['services'][name]
     if 'restart' in service:
         raise ValueError("restart is not supported. use deploy instead")
-    instance = _instance_name(app, name)
+    instance = _instance_name(app, name, replica)
     # NB: we assume that the default entrypoint simply calls exec on arguments
     # it does not recognize
     cmd = ['singularity', 'run', 'instance://'+instance]
@@ -223,8 +223,8 @@ def _run(app, name, config):
     if os.fork() != 0:
         return
     
-    stderr = open(_log_prefix(app, name)+".stderr", "wb")
-    stdout = open(_log_prefix(app, name)+".stdout", "wb")
+    stderr = open(_log_prefix(app, name, replica)+".stderr", "wb")
+    stdout = open(_log_prefix(app, name, replica)+".stdout", "wb")
     
     with daemon.DaemonContext(detach_process=True, stderr=stderr, stdout=stdout):
         ret = 0
@@ -355,15 +355,16 @@ class StackCache(dict):
 
 def list_stacks(args):
     stacks = StackCache.load()
-    template = '{:30s} {:30s}'
-    print(template.format('Stack', 'Services'))
-    print(template.format('='*30, '='*30))
+    template = '{:30s} {:30s} {:7s}'
+    print(template.format('Stack', 'Services', 'Replicas'))
+    print(template.format('='*30, '='*30, '='*7))
     for name, config in stacks.items():
         if not config.get('active', False):
             continue
         for i, service in enumerate(config['services'].keys()):
-            print(template.format(name if i==0 else '', service))
-        print(template.format('-'*30, '-'*30))
+            reps = int(config['services'][service].get('deploy', {}).get('replicas', 1))
+            print(template.format(name if i==0 else '', service, str(reps) if reps > 1 else ''))
+        print(template.format('-'*30, '-'*30, '-'*7))
 
 def deploy(args):
     stacks = StackCache()
@@ -373,20 +374,25 @@ def deploy(args):
     try:
         for name in start_order(config['services']):
             service = config['services'][name]
-            instance = _instance_name(app, name)
-            if _instance_running(instance):
-                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-            image_spec = singularity_command_line(name, config)
-            if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
-                raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
-            subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-            _run(app, name, config)
+            replicas = int(service.get('deploy', {}).get('replicas', 1))
+            for replica in range(replicas):
+                myconfig = copy.deepcopy(config)
+                instance = _instance_name(app, name, replica)
+                if _instance_running(instance):
+                    subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+                image_spec = singularity_command_line(name, myconfig)
+                if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
+                    raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+                subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+                _run(app, name, replica, myconfig)
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
-            instance = _instance_name(app, name)
-            if _instance_running(instance):
-                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+            replicas = int(service.get('deploy', {}).get('replicas', 1))
+            for replica in range(replicas):
+                instance = _instance_name(app, name, replica)
+                if _instance_running(instance):
+                    subprocess.check_call(['singularity', 'instance.stop'] + [instance])
         raise e
 
 def rm(args):
@@ -394,9 +400,12 @@ def rm(args):
     app = args.name
     config = stacks[app]
     for name in reversed(list(start_order(config['services']))):
-        instance = _instance_name(app, name)
-        if _instance_running(instance):
-            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+        service = config['services'][name]
+        replicas = int(service.get('deploy', {}).get('replicas', 1))
+        for replica in range(replicas):
+            instance = _instance_name(app, name, replica)
+            if _instance_running(instance):
+                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
     stacks.remove(app)
 
 def logs(args):
@@ -406,8 +415,8 @@ def logs(args):
 
     queue = Queue(64)
     stop = Event()
-    def _tail(queue, counter, app, follow, name, suffix, linetag=''):
-        path = "{}.{}".format(_log_prefix(app, name),suffix)
+    def _tail(queue, counter, app, follow, name, replica, suffix, linetag=''):
+        path = "{}.{}".format(_log_prefix(app, name, replica),suffix)
         with open(path, "rb") as f:
             size = os.stat(path).st_size
             if follow:
@@ -438,7 +447,7 @@ def logs(args):
     else:
         names = [args.service]
     
-    template = "({{:{}s}} {{:6s}}) ".format(max(map(len, names)))
+    template = "({{:{}s}}:{{}} {{:6s}}) ".format(max(map(len, names)))
     
     threads = []
     class counter(object):
@@ -446,10 +455,16 @@ def logs(args):
             self.count = 0
     thread_count = counter()
     for name in names:
-        if args.stderr:
-            threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, "stderr", template.format(name,"stderr"))))
-        if args.stdout:
-            threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, "stdout", template.format(name,"stdout"))))
+        replicas = int(config['services'][name].get('deploy', {}).get('replicas', 1))
+        if args.replica is None:
+            replicas = range(int(config['services'][name].get('deploy', {}).get('replicas', 1)))
+        else:
+            replicas = [args.replica]
+        for replica in replicas:
+            if args.stderr:
+                threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, replica, "stderr", template.format(name,replica,"stderr"))))
+            if args.stdout:
+                threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, replica, "stdout", template.format(name,replica,"stdout"))))
     for t in threads:
         thread_count.count += 1
         t.start()
@@ -494,6 +509,7 @@ def main():
 
     p = add_command(logs)
     p.add_argument('service', default=None, nargs='?', type=str, help='Dump logs for this service only')
+    p.add_argument('replica', default=None, nargs='?', type=int, help='Dump logs for this replica only')
     p.add_argument('-f', '--follow', default=False, action="store_true", help='Follow log output')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
