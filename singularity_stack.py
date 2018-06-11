@@ -16,7 +16,7 @@ import tempfile
 import asyncio
 import pathlib
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 def start_order(services):
     """
@@ -92,7 +92,13 @@ def _init_volume(image, source, target):
     if not os.path.exists(tagfile):
         cmd = "cp -r '{}' '{}'".format("/var/singularity/mnt/final/"+target, source)
         subprocess.check_call(["singularity", "mount", image, "sh", "-c", cmd])
-        open(tagfile, 'w').close()
+        with open(tagfile, 'w') as f:
+            f.write('{}:{}'.format(image,target))
+
+def init_volume_cmd(args):
+    if os.path.exists(args.dest) and not args.force:
+        raise FileExistsError("Destination path {} already exists. Pass --force to overwrite".format(args.dest))
+    _init_volume(args.image, args.dest, args.source)
 
 def singularity_command_line(name, config):
     """
@@ -491,6 +497,15 @@ def main():
     p.add_argument('-f', '--follow', default=False, action="store_true", help='Follow log output')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
+
+
+    subvolume = subparsers.add_parser('volume').add_subparsers()
+    p = subvolume.add_parser('init', description='initialize a singularity-stack volume by copying a path from the image to the host filesystem.')
+    p.set_defaults(func=init_volume_cmd)
+    p.add_argument('image', help='singularity image')
+    p.add_argument('source', help='source path in image')
+    p.add_argument('dest', help='destination path in host filesystem')
+    p.add_argument('-f', '--force', default=False, action='store_true', help='overwrite destination path if it exists')
 
     opts = parser.parse_args()
     opts.func(opts)
