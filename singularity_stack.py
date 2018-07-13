@@ -378,16 +378,17 @@ class StackCache(dict):
 
 def list_stacks(args):
     stacks = StackCache.load()
-    template = '{:30s} {:30s} {:7s}'
-    print(template.format('Stack', 'Services', 'Replicas'))
-    print(template.format('='*30, '='*30, '='*7))
+    template = '{:30s} {:30s} {:7s} {:8s}'
+    print(template.format('Stack', 'Services', 'Replicas', 'Instance'))
+    print(template.format('='*30, '='*30, '='*7, '='*8))
     for name, config in stacks.items():
         if not config.get('active', False):
             continue
         for i, service in enumerate(config['services'].keys()):
             reps = int(config['services'][service].get('deploy', {}).get('replicas', 1))
-            print(template.format(name if i==0 else '', service, str(reps) if reps > 1 else ''))
-        print(template.format('-'*30, '-'*30, '-'*7))
+            label = _instance_name(name, service, 0)
+            print(template.format(name if i==0 else '', service, str(reps) if reps > 1 else '', label))
+        print(template.format('-'*30, '-'*30, '-'*7, '-'*8))
 
 def deploy(args):
     stacks = StackCache()
