@@ -15,6 +15,7 @@ import getpass
 import tempfile
 import asyncio
 import pathlib
+import socket
 
 __version__ = "0.2.2"
 
@@ -221,7 +222,29 @@ def _run(app, name, replica, config):
     delay = _parse_duration(restart_policy.get('delay', ''))
     
     if os.fork() != 0:
-        return
+        # wait for service to start listening on exposed ports
+        for mapping in service.get('ports', []):
+            if ':' in mapping:
+                src, dest = map(int, mapping.split(':'))
+            else:
+                src = int(mapping)
+                dest = src
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            timeout = 1.
+            for _ in range(20):
+                try:
+                    s.connect((socket.gethostname(), dest))
+                    break
+                except ConnectionRefusedError:
+                    print('connection refused on {}:{}, retry after {:.0f} s'.format(socket.gethostname(), dest, timeout))
+                    time.sleep(timeout)
+                    timeout *= 1.5
+                    continue
+            else:
+                raise CalledProcessError('{}.{} failed to start'.format(app, name))
+            print('connected to {}:{}'.format(socket.gethostname(), dest))
+      
+        return True
     
     stderr = open(_log_prefix(app, name, replica)+".stderr", "wb")
     stdout = open(_log_prefix(app, name, replica)+".stdout", "wb")
