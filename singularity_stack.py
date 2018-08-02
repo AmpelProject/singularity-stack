@@ -5,19 +5,22 @@ Deploy a Docker application with Singularity, in a manner similar to `docker-sta
 """
 
 import yaml
+import json
 import daemon
 import sys, os, stat, shutil
 import warnings
 import re
 import time
+import select
 import subprocess
 import getpass
 import tempfile
 import asyncio
 import pathlib
 import socket
+import multiprocessing
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 def start_order(services):
     """
@@ -191,12 +194,94 @@ def _instance_running(name):
         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret == 0
 
-def _run(app, name, replica, config):
+def _start_replica_set(app, name, config):
+    service = config['services'][name]
+
+    # in parent process, wait for service to start listening on exposed ports
+    if os.fork() != 0:
+        for mapping in service.get('ports', []):
+            if ':' in mapping:
+                src, dest = map(int, mapping.split(':'))
+            else:
+                src = int(mapping)
+                dest = src
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            timeout = 1.
+            for _ in range(20):
+                try:
+                    s.connect((socket.gethostname(), dest))
+                    break
+                except ConnectionRefusedError:
+                    print('connection refused on {}:{}, retry after {:.0f} s'.format(socket.gethostname(), dest, timeout))
+                    time.sleep(timeout)
+                    timeout *= 1.5
+                    continue
+            else:
+                raise CalledProcessError('{}.{} failed to start'.format(app, name))
+            print('connected to {}:{}'.format(socket.gethostname(), dest))
+      
+        return True
+    # in child process, do actual work
+    else:
+        for i in range(replicas):
+            myconfig = copy.deepcopy(config)
+            _run(app, name, replica, myconfig)
+        pass
+
+class LogEmitter:
+    def __init__(self, queue, **kwargs):
+        self._queue = queue
+        self.extra = kwargs
+    def write(self, msg):
+        msg = msg.rstrip()
+        if len(msg) == 0:
+            return
+        payload = dict(timestamp=time.time(), msg=msg)
+        payload.update(self.extra)
+        self._queue.put(payload)
+
+class LogCollector:
+    def __init__(self, queue, procs, outfile):
+        self._queue = queue
+        self._procs = procs
+        self._file = outfile
+    def run(self):
+        for proc in self._procs.values():
+            proc.start()
+        while len(self._procs) > 0 or not self._queue.empty():
+            msg = self._queue.get()
+            if isinstance(msg, int):
+                # got sentinel, reap child process
+                self._procs[msg].join()
+                del self._procs[msg]
+            else:
+                json.dump(msg, self._file)
+                self._file.write('\n')
+
+def _run_replica_set(app, name, configs):
+    replicas = len(configs)
+    with daemon.DaemonContext(detach_process=True):
+        queue = multiprocessing.Queue()
+        outfile = open(_log_prefix(app, name)+".json", "w")
+        procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
+        collector = LogCollector(queue, procs, outfile)
+        sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
+        collector.run()
+
+def _run(app, name, replica, config, log_queue):
+    try:
+        _run_impl(app, name, replica, config, log_queue)
+    finally:
+        log_queue.put(replica)
+
+def _run_impl(app, name, replica, config, log_queue):
     """
     Fork a daemon process that starts the service process in a Singularity
     instance, redirects its stdout/stderr to files, and restarts it on failure
     according to the given `restart_policy`
     """
+    sys.stderr = sys.stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="nanny")
+
     service = config['services'][name]
     if 'restart' in service:
         raise ValueError("restart is not supported. use deploy instead")
@@ -221,60 +306,48 @@ def _run(app, name, replica, config):
         max_attempts = restart_policy.get('max_attempts', sys.maxsize)
     delay = _parse_duration(restart_policy.get('delay', ''))
     
-    if os.fork() != 0:
-        # wait for service to start listening on exposed ports
-        for mapping in service.get('ports', []):
-            if ':' in mapping:
-                src, dest = map(int, mapping.split(':'))
-            else:
-                src = int(mapping)
-                dest = src
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            timeout = 1.
-            for _ in range(20):
-                try:
-                    s.connect((socket.gethostname(), dest))
-                    break
-                except ConnectionRefusedError:
-                    print('connection refused on {}:{}, retry after {:.0f} s'.format(socket.gethostname(), dest, timeout))
-                    time.sleep(timeout)
-                    timeout *= 1.5
-                    continue
-            else:
-                raise CalledProcessError('{}.{} failed to start'.format(app, name))
-            print('connected to {}:{}'.format(socket.gethostname(), dest))
-      
-        return True
-    
-    stderr = open(_log_prefix(app, name, replica)+".stderr", "wb")
-    stdout = open(_log_prefix(app, name, replica)+".stdout", "wb")
-    
-    with daemon.DaemonContext(detach_process=True, stderr=stderr, stdout=stdout):
-        ret = 0
-        for _ in range(-1, max_attempts):
-            if not _instance_running(instance):
-                print('{} instance is gone!'.format(instance))
-                sys.exit(1)
-            ret = subprocess.call(cmd, env=env, stdout=stdout, stderr=stderr)
-            if ret == 0 and restart_policy.get('condition', 'no') != 'any':
+    ret = 0
+    for _ in range(-1, max_attempts):
+        if not _instance_running(instance):
+            print('{} instance is gone!'.format(instance))
+            return 1
+        stderr = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stderr")
+        stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stdout")
+        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        reads = [proc.stdout.fileno(), proc.stderr.fileno()]
+        while True:
+            ready = select.select(reads, [], [])
+            for fd in ready:
+                if fd == reads[0]:
+                    stdout.write(proc.stdout.readline())
+                elif fd == reads[1]:
+                    stderr.write(proc.stderr.readline())
+            if proc.poll() is not None:
+                # process has exited, suck pipes dry
+                for fd, sink in ((proc.stdout, stdout), (proc.stderr, stderr)):
+                    line = fd.read()
+                    if len(line) > 0:
+                        sink.write(line.decode())
                 break
-            else:
-                print('sleeping {} before restart'.format(delay))
-                time.sleep(delay)
-        if ret != 0:
-            print('failed permanently with status {}\n'.format(ret))
+        ret = proc.wait()
+        if ret == 0 and restart_policy.get('condition', 'no') != 'any':
+            break
         else:
-            print('exited cleanly\n')
-        for temp in service.get('_tempfiles', []):
-            if hasattr(temp, 'name'):
-                temp = getattr(temp, 'name')
-            print('removing {}'.format(temp))
-            if os.path.isdir(temp):
-                shutil.rmtree(temp)
-            else:
-                os.unlink(temp)
-                
-        sys.exit(ret)
+            print('sleeping {} before restart'.format(delay))
+            time.sleep(delay)
+    if ret != 0:
+        print('failed permanently with status {}'.format(ret))
+    else:
+        print('exited cleanly')
+    for temp in service.get('_tempfiles', []):
+        if hasattr(temp, 'name'):
+            temp = getattr(temp, 'name')
+        print('removing {}'.format(temp))
+        if os.path.isdir(temp):
+            shutil.rmtree(temp)
+        else:
+            os.unlink(temp)
+    return ret
 
 import re
 def expandvars(path, environ=os.environ):
@@ -399,16 +472,18 @@ def deploy(args):
         for name in start_order(config['services']):
             service = config['services'][name]
             replicas = int(service.get('deploy', {}).get('replicas', 1))
+            configs = []
             for replica in range(replicas):
-                myconfig = copy.deepcopy(config)
                 instance = _instance_name(app, name, replica)
                 if _instance_running(instance):
                     subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+                myconfig = copy.deepcopy(config)
+                configs.append(myconfig)
                 image_spec = singularity_command_line(name, myconfig)
                 if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
                     raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
                 subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-                _run(app, name, replica, myconfig)
+            _run_replica_set(app, name, configs)
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
@@ -433,81 +508,47 @@ def rm(args):
     stacks.remove(app)
 
 def logs(args):
-    from threading import Thread, Event, Semaphore
-    import threading
-    from queue import Queue, Empty
-
-    queue = Queue(64)
-    stop = Event()
-    def _tail(queue, counter, app, follow, name, replica, suffix, linetag=''):
-        path = "{}.{}".format(_log_prefix(app, name, replica),suffix)
-        with open(path, "rb") as f:
-            size = os.stat(path).st_size
-            if follow:
-                # start 1 kB from the end of the file
-                offset = -min((1024, size))
-                f.seek(offset,2)
-            # consume the partial line
-            f.readline()
-
-            while not stop.is_set():
-                line = f.readline()
-                if len(line) == 0:
-                    if follow:
-                        continue
-                    else:
-                        break
-                queue.put((linetag, line.decode()))
-                time.sleep(0.01)
-        counter.count -= 1
-
     config = StackCache.load()[args.name]
     if not args.stderr or args.stdout:
         args.stderr = True
         args.stdout = True
-    
+
     if args.service is None:
         names = sorted(config['services'].keys())
+        raise ValueError("I need a single service at the moment")
     else:
         names = [args.service]
-    
-    template = "({{:{}s}}:{{}} {{:6s}}) ".format(max(map(len, names)))
-    
-    threads = []
-    class counter(object):
-        def __init__(self):
-            self.count = 0
-    thread_count = counter()
-    for name in names:
-        replicas = int(config['services'][name].get('deploy', {}).get('replicas', 1))
-        if args.replica is None:
-            replicas = range(int(config['services'][name].get('deploy', {}).get('replicas', 1)))
-        else:
-            replicas = [args.replica]
-        for replica in replicas:
-            if args.stderr:
-                threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, replica, "stderr", template.format(name,replica,"stderr"))))
-            if args.stdout:
-                threads.append(Thread(target=_tail, args=(queue, thread_count, args.name, args.follow, name, replica, "stdout", template.format(name,replica,"stdout"))))
-    for t in threads:
-        thread_count.count += 1
-        t.start()
-    try:
-        while thread_count.count > 0:
-            try:
-                tag, line = queue.get(timeout=0.1)
-            except Empty:
-                continue
-            sys.stdout.write(tag)
-            sys.stdout.write(line)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop.set()
 
-    for t in threads:
-        t.join()
-    
+    template = "{{:23s}} {{:{}s}}:{{}} {{:7s}} \u23b8 ".format(max(map(len, names)))
+
+    path = _log_prefix(args.name, args.service)+".json"
+    f = open(path, "rb")
+    size = os.stat(path).st_size
+    if args.follow:
+        # start 1 kB from the end of the file
+        offset = -min((1024, size))
+        f.seek(offset, 2)
+        # consume the partial line
+        f.readline()
+    while True:
+       line = f.readline()
+       if len(line) == 0:
+           if not args.follow:
+               break
+           else:
+               try:
+                   time.sleep(0.5)
+               except KeyboardInterrupt:
+                   break
+               continue
+       payload = json.loads(line)
+       if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
+           continue
+       if (args.replica is not None and payload.get('replica', None) != args.replica):
+           continue
+       ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(payload['timestamp'])) + "{:.3f}".format(payload['timestamp'] % 1)[1:]
+       sys.stdout.write(template.format(ts, args.service, payload.get('replica', 0), payload['source']))
+       print(payload['msg'])
 
 def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
