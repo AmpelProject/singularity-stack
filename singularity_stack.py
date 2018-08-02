@@ -463,6 +463,13 @@ def list_stacks(args):
             print(template.format(name if i==0 else '', service, str(reps) if reps > 1 else '', label))
         print(template.format('-'*30, '-'*30, '-'*7, '-'*8))
 
+def _sub_replica(obj, replica):
+    pattern = "{{.Task.Slot}}"
+    if isinstance(obj, str) and pattern in obj:
+        return obj.replace(pattern, str(replica))
+    else:
+        return obj
+
 def deploy(args):
     stacks = StackCache()
     config = stacks.add(args.name, args.compose_file)
@@ -478,6 +485,7 @@ def deploy(args):
                 if _instance_running(instance):
                     subprocess.check_call(['singularity', 'instance.stop'] + [instance])
                 myconfig = copy.deepcopy(config)
+                myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
                 configs.append(myconfig)
                 image_spec = singularity_command_line(name, myconfig)
                 if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
