@@ -471,7 +471,7 @@ def list_stacks(args):
 def _sub_replica(obj, replica):
     pattern = "{{.Task.Slot}}"
     if isinstance(obj, str) and pattern in obj:
-        return obj.replace(pattern, str(replica))
+        return obj.replace(pattern, str(replica+1))
     else:
         return obj
 
