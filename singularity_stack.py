@@ -194,8 +194,8 @@ def _instance_running(name):
         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret == 0
 
-def _start_replica_set(app, name, config):
-    service = config['services'][name]
+def _start_replica_set(app, name, configs):
+    service = configs[0]['services'][name]
 
     # in parent process, wait for service to start listening on exposed ports
     if os.fork() != 0:
@@ -223,10 +223,10 @@ def _start_replica_set(app, name, config):
         return True
     # in child process, do actual work
     else:
-        for i in range(replicas):
-            myconfig = copy.deepcopy(config)
-            _run(app, name, replica, myconfig)
-        pass
+        log = open('{}_{}.log'.format(app, name), 'wb')
+        with daemon.DaemonContext(stderr=log, stdout=log, working_directory=os.getcwd()):
+            _run_replica_set(app, name, configs)
+            sys.exit(0)
 
 class LogEmitter:
     def __init__(self, queue, **kwargs):
@@ -257,20 +257,23 @@ class LogCollector:
             else:
                 json.dump(msg, self._file)
                 self._file.write('\n')
+                self._file.flush()
 
 def _run_replica_set(app, name, configs):
     replicas = len(configs)
-    with daemon.DaemonContext(detach_process=True):
-        queue = multiprocessing.Queue()
-        outfile = open(_log_prefix(app, name)+".json", "w")
-        procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
-        collector = LogCollector(queue, procs, outfile)
-        sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
-        collector.run()
+    queue = multiprocessing.Queue()
+    outfile = open(_log_prefix(app, name)+".json", "w")
+    procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
+    collector = LogCollector(queue, procs, outfile)
+    #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
+    collector.run()
 
 def _run(app, name, replica, config, log_queue):
     try:
         _run_impl(app, name, replica, config, log_queue)
+    except:
+        import traceback
+        traceback.print_exc()
     finally:
         log_queue.put(replica)
 
@@ -316,12 +319,14 @@ def _run_impl(app, name, replica, config, log_queue):
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         reads = [proc.stdout.fileno(), proc.stderr.fileno()]
         while True:
-            ready = select.select(reads, [], [])
+            ready = select.select(reads, [], [], 1)[0]
             for fd in ready:
                 if fd == reads[0]:
-                    stdout.write(proc.stdout.readline())
+                    line = proc.stdout.readline().decode()
+                    stdout.write(line)
                 elif fd == reads[1]:
-                    stderr.write(proc.stderr.readline())
+                    line = proc.stderr.readline().decode()
+                    stderr.write(line)
             if proc.poll() is not None:
                 # process has exited, suck pipes dry
                 for fd, sink in ((proc.stdout, stdout), (proc.stderr, stderr)):
@@ -491,7 +496,7 @@ def deploy(args):
                 if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
                     raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
                 subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-            _run_replica_set(app, name, configs)
+            _start_replica_set(app, name, configs)
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
@@ -538,6 +543,7 @@ def logs(args):
         f.seek(offset, 2)
         # consume the partial line
         f.readline()
+    i = 0
     while True:
        line = f.readline()
        if len(line) == 0:
@@ -549,7 +555,11 @@ def logs(args):
                except KeyboardInterrupt:
                    break
                continue
-       payload = json.loads(line)
+       i += 1
+       try:
+           payload = json.loads(line)
+       except json.decoder.JSONDecodeError:
+           continue
        if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
            continue
        if (args.replica is not None and payload.get('replica', None) != args.replica):
