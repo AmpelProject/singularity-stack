@@ -475,6 +475,29 @@ def _sub_replica(obj, replica):
     else:
         return obj
 
+def _start_service(app, name, config):
+    service = config['services'][name]
+    replicas = int(service.get('deploy', {}).get('replicas', 1))
+    configs = []
+    for replica in range(replicas):
+        instance = _instance_name(app, name, replica)
+        if _instance_running(instance):
+            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+        myconfig = copy.deepcopy(config)
+        myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
+        configs.append(myconfig)
+        image_spec = singularity_command_line(name, myconfig)
+        if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
+            raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+    _start_replica_set(app, name, configs)
+
+def update(args):
+    stacks = StackCache()
+    config = stacks[args.name]
+    del stacks
+    _start_service(args.name, args.service, config)
+
 def deploy(args):
     stacks = StackCache()
     config = stacks.add(args.name, args.compose_file)
@@ -482,21 +505,7 @@ def deploy(args):
     app = args.name
     try:
         for name in start_order(config['services']):
-            service = config['services'][name]
-            replicas = int(service.get('deploy', {}).get('replicas', 1))
-            configs = []
-            for replica in range(replicas):
-                instance = _instance_name(app, name, replica)
-                if _instance_running(instance):
-                    subprocess.check_call(['singularity', 'instance.stop'] + [instance])
-                myconfig = copy.deepcopy(config)
-                myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
-                configs.append(myconfig)
-                image_spec = singularity_command_line(name, myconfig)
-                if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
-                    raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
-                subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-            _start_replica_set(app, name, configs)
+            _start_service(app, name, config)
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
@@ -587,6 +596,9 @@ def main():
     add_command(list_stacks, 'list', False)
     p = add_command(deploy)
     p.add_argument('-c', '--compose-file', type=str, default=None)
+
+    p = add_command(update)
+    p.add_argument('service')
 
     p = add_command(rm)
 
