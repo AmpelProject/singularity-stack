@@ -262,7 +262,7 @@ class LogCollector:
 def _run_replica_set(app, name, configs):
     replicas = len(configs)
     queue = multiprocessing.Queue()
-    outfile = open(_log_prefix(app, name)+".json", "w")
+    outfile = open(_log_prefix(app, name)+".json", "w", encoding="utf-8")
     procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
     collector = LogCollector(queue, procs, outfile)
     #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
@@ -566,7 +566,7 @@ def logs(args):
                continue
        i += 1
        try:
-           payload = json.loads(line)
+           payload = json.loads(line.decode('utf-8'))
        except json.decoder.JSONDecodeError:
            continue
        if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
