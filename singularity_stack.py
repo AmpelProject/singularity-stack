@@ -19,6 +19,9 @@ import asyncio
 import pathlib
 import socket
 import multiprocessing
+import logging
+
+log = logging.getLogger(__name__)
 
 __version__ = "0.3.0"
 
@@ -199,6 +202,7 @@ def _start_replica_set(app, name, configs):
 
     # in parent process, wait for service to start listening on exposed ports
     if os.fork() != 0:
+        log.debug("Waiting for {}.{} to start".format(app, name))
         for mapping in service.get('ports', []):
             if ':' in mapping:
                 src, dest = map(int, mapping.split(':'))
@@ -212,21 +216,26 @@ def _start_replica_set(app, name, configs):
                     s.connect((socket.gethostname(), dest))
                     break
                 except ConnectionRefusedError:
-                    print('connection refused on {}:{}, retry after {:.0f} s'.format(socket.gethostname(), dest, timeout))
+                    log.debug('connection refused on {}:{}, retry after {:.0f} s'.format(socket.gethostname(), dest, timeout))
                     time.sleep(timeout)
                     timeout *= 1.5
                     continue
             else:
                 raise CalledProcessError('{}.{} failed to start'.format(app, name))
-            print('connected to {}:{}'.format(socket.gethostname(), dest))
-      
+            log.info('connected to {}:{}'.format(socket.gethostname(), dest))
+
+        log.info("Started {}.{} (x{})".format(app, name, len(configs)))
+
         return True
     # in child process, do actual work
     else:
-        log = open('{}_{}.log'.format(app, name), 'wb')
-        with daemon.DaemonContext(stderr=log, stdout=log, working_directory=os.getcwd()):
+        logfile = open('{}_{}.log'.format(app, name), 'wb')
+        log.debug('starting replicas')
+        with daemon.DaemonContext(stderr=logfile, stdout=logfile, working_directory=os.getcwd()):
+            log.debug('entered daemon context')
             _run_replica_set(app, name, configs)
-            sys.exit(0)
+        log.debug('exiting')
+        sys.exit(0)
 
 class LogEmitter:
     def __init__(self, queue, **kwargs):
@@ -246,6 +255,7 @@ class LogCollector:
         self._procs = procs
         self._file = outfile
     def run(self):
+        log.debug('collecting logs')
         for proc in self._procs.values():
             proc.start()
         while len(self._procs) > 0 or not self._queue.empty():
@@ -475,14 +485,20 @@ def _sub_replica(obj, replica):
     else:
         return obj
 
+def _stop(app, name, replica):
+    instance = _instance_name(app, name, replica)
+    if _instance_running(instance):
+        subprocess.check_call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        log.info("Stopped instance {} ({}.{}.{})".format(instance, app, name, replica))
+
 def _start_service(app, name, config):
+    log.debug('Starting service {}.{}'.format(app, name))
     service = config['services'][name]
     replicas = int(service.get('deploy', {}).get('replicas', 1))
     configs = []
     for replica in range(replicas):
+        _stop(app, name, replica)
         instance = _instance_name(app, name, replica)
-        if _instance_running(instance):
-            subprocess.check_call(['singularity', 'instance.stop'] + [instance])
         myconfig = copy.deepcopy(config)
         myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
         configs.append(myconfig)
@@ -490,6 +506,7 @@ def _start_service(app, name, config):
         if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
             raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
         subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+        log.debug("Started instance {} ({}.{}.{})".format(instance, app, name, replica))
     _start_replica_set(app, name, configs)
 
 def update(args):
@@ -524,9 +541,7 @@ def rm(args):
         service = config['services'][name]
         replicas = int(service.get('deploy', {}).get('replicas', 1))
         for replica in range(replicas):
-            instance = _instance_name(app, name, replica)
-            if _instance_running(instance):
-                subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+            _stop(app, name, replica)
     stacks.remove(app)
 
 def logs(args):
@@ -581,7 +596,8 @@ def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(prog='singularity-stack', description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
     parser.add_argument('--version', action='version', version='singularity-stack {}'.format(__version__))
-    
+    parser.add_argument('--debug', action='store_true', default=False)
+
     subparsers = parser.add_subparsers(help='command help')
 
     def add_command(f, name=None, needs_name=True):
@@ -619,6 +635,9 @@ def main():
     p.add_argument('-f', '--force', default=False, action='store_true', help='overwrite destination path if it exists')
 
     opts = parser.parse_args()
+
+    logging.basicConfig(format='%(asctime)s %(filename)s:%(lineno)s (%(process)d) %(funcName)s() %(levelname)s %(message)s',
+                        level='DEBUG' if opts.debug else 'INFO')
     opts.func(opts)
 
 if __name__ == "__main__":
