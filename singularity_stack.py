@@ -7,11 +7,13 @@ Deploy a Docker application with Singularity, in a manner similar to `docker-sta
 import yaml
 import json
 import daemon
+import daemon.pidfile
 import sys, os, stat, shutil
 import warnings
 import re
 import time
 import select
+import signal
 import subprocess
 import getpass
 import tempfile
@@ -231,7 +233,8 @@ def _start_replica_set(app, name, configs):
     else:
         logfile = open('{}_{}.log'.format(app, name), 'wb')
         log.debug('starting replicas')
-        with daemon.DaemonContext(stderr=logfile, stdout=logfile, working_directory=os.getcwd()):
+        pidfile = daemon.pidfile.PIDLockFile('{}_{}.pid'.format(app, name))
+        with daemon.DaemonContext(pidfile=pidfile, stderr=logfile, stdout=logfile, working_directory=os.getcwd()):
             log.debug('entered daemon context')
             _run_replica_set(app, name, configs)
         log.debug('exiting')
@@ -259,7 +262,16 @@ class LogCollector:
         for proc in self._procs.values():
             proc.start()
         while len(self._procs) > 0 or not self._queue.empty():
-            msg = self._queue.get()
+            try:
+                msg = self._queue.get()
+            except KeyboardInterrupt:
+                log.debug('Caught SIGINT; shutting down')
+                for proc in self._procs.values():
+                    proc.terminate()
+                for proc in self._procs.values():
+                    proc.join()
+                log.debug('Shut down')
+                break
             if isinstance(msg, int):
                 # got sentinel, reap child process
                 self._procs[msg].join()
@@ -485,19 +497,38 @@ def _sub_replica(obj, replica):
     else:
         return obj
 
-def _stop(app, name, replica):
-    instance = _instance_name(app, name, replica)
-    if _instance_running(instance):
-        subprocess.check_call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        log.info("Stopped instance {} ({}.{}.{})".format(instance, app, name, replica))
+def _stop(app, name, config):
+    try:
+        with open('{}_{}.pid'.format(app,name), 'r') as pidfile:
+            pid = int(pidfile.read())
+            log.debug('Killing process {}'.format(pid))
+            try:
+                os.kill(pid, signal.SIGINT)
+            except:
+                pass
+            while True:
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(1)
+                except Exception as e:
+                    break
+    except FileNotFoundError:
+        pass
+    service = config['services'][name]
+    replicas = int(service.get('deploy', {}).get('replicas', 1))
+    for replica in range(replicas):
+        instance = _instance_name(app, name, replica)
+        if _instance_running(instance):
+            subprocess.check_call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            log.info("Stopped instance {} ({}.{}.{})".format(instance, app, name, replica))
 
 def _start_service(app, name, config):
+    _stop(app, name, config)
     log.debug('Starting service {}.{}'.format(app, name))
     service = config['services'][name]
     replicas = int(service.get('deploy', {}).get('replicas', 1))
     configs = []
     for replica in range(replicas):
-        _stop(app, name, replica)
         instance = _instance_name(app, name, replica)
         myconfig = copy.deepcopy(config)
         myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
@@ -514,6 +545,12 @@ def update(args):
     config = stacks[args.name]
     del stacks
     _start_service(args.name, args.service, config)
+
+def stop(args):
+    stacks = StackCache()
+    config = stacks[args.name]
+    del stacks
+    _stop(args.name, args.service, config)
 
 def deploy(args):
     stacks = StackCache()
@@ -538,10 +575,7 @@ def rm(args):
     app = args.name
     config = stacks[app]
     for name in reversed(list(start_order(config['services']))):
-        service = config['services'][name]
-        replicas = int(service.get('deploy', {}).get('replicas', 1))
-        for replica in range(replicas):
-            _stop(app, name, replica)
+        _stop(app, name, config)
     stacks.remove(app)
 
 def logs(args):
@@ -614,6 +648,9 @@ def main():
     p.add_argument('-c', '--compose-file', type=str, default=None)
 
     p = add_command(update)
+    p.add_argument('service')
+
+    p = add_command(stop)
     p.add_argument('service')
 
     p = add_command(rm)
