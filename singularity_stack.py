@@ -480,6 +480,7 @@ class StackCache(dict):
             self.fd.close()
 
 def list_stacks(args):
+    """List active stacks"""
     stacks = StackCache.load()
     template = '{:30s} {:30s} {:7s} {:8s}'
     print(template.format('Stack', 'Services', 'Replicas', 'Instance'))
@@ -544,18 +545,21 @@ def _start_service(app, name, config):
     _start_replica_set(app, name, configs)
 
 def update(args):
+    """[Re]start a single service"""
     stacks = StackCache()
     config = stacks[args.name]
     del stacks
     _start_service(args.name, args.service, config)
 
 def stop(args):
+    """Stop a single service"""
     stacks = StackCache()
     config = stacks[args.name]
     del stacks
     _stop(args.name, args.service, config)
 
 def deploy(args):
+    """[Re]start all services in the stack"""
     stacks = StackCache()
     config = stacks.add(args.name, args.compose_file)
     del stacks
@@ -570,6 +574,7 @@ def deploy(args):
         raise e
 
 def rm(args):
+    """Stop all services in the stack"""
     stacks = StackCache()
     app = args.name
     config = stacks[app]
@@ -578,6 +583,7 @@ def rm(args):
     stacks.remove(app)
 
 def logs(args):
+    """View service logs"""
     config = StackCache.load()[args.name]
     if not args.stderr or args.stdout:
         args.stderr = True
@@ -736,7 +742,7 @@ def main():
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
 
 
-    subvolume = subparsers.add_parser('volume').add_subparsers()
+    subvolume = subparsers.add_parser('volume', help=_init_volume.__doc__).add_subparsers()
     p = subvolume.add_parser('init', description='initialize a singularity-stack volume by copying a path from the image to the host filesystem.')
     p.set_defaults(func=init_volume_cmd)
     p.add_argument('image', help='singularity image')
