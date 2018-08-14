@@ -193,6 +193,9 @@ def _instance_name(*args):
 def _log_prefix(*args):
     return "/var/tmp/{}.singularity.{}".format(getpass.getuser(), _instance_name(*args))
 
+def _pid_file(*args):
+    return '/var/tmp/{}_{}.pid'.format(getpass.getuser(), '_'.join(args))
+
 def _instance_running(name):
     # FIXME: make this check for an exact match
     ret = subprocess.call(['singularity', 'instance.list', name],
@@ -233,7 +236,7 @@ def _start_replica_set(app, name, configs):
     else:
         logfile = open('{}_{}.log'.format(app, name), 'wb')
         log.debug('starting replicas')
-        pidfile = daemon.pidfile.PIDLockFile('{}_{}.pid'.format(app, name))
+        pidfile = daemon.pidfile.PIDLockFile(_pid_file(app, name))
         with daemon.DaemonContext(pidfile=pidfile, stderr=logfile, stdout=logfile, working_directory=os.getcwd()):
             log.debug('entered daemon context')
             _run_replica_set(app, name, configs)
@@ -499,7 +502,7 @@ def _sub_replica(obj, replica):
 
 def _stop(app, name, config):
     try:
-        with open('{}_{}.pid'.format(app,name), 'r') as pidfile:
+        with open(_pid_file(app,name), 'r') as pidfile:
             pid = int(pidfile.read())
             log.debug('Killing process {}'.format(pid))
             try:
@@ -563,11 +566,7 @@ def deploy(args):
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
         for name in reversed(list(start_order(config['services']))):
-            replicas = int(service.get('deploy', {}).get('replicas', 1))
-            for replica in range(replicas):
-                instance = _instance_name(app, name, replica)
-                if _instance_running(instance):
-                    subprocess.check_call(['singularity', 'instance.stop'] + [instance])
+            _stop(app, name, config)
         raise e
 
 def rm(args):
@@ -626,6 +625,76 @@ def logs(args):
        sys.stdout.write(template.format(ts, args.service, payload.get('replica', 0), payload['source']))
        print(payload['msg'])
 
+def _ppid(pid):
+    # lifted from psutil
+    with open('/proc/{}/stat'.format(pid), 'rb') as f:
+        data = f.read()
+    rpar = data.rfind(b')')
+    dset = data[rpar + 2:].split()
+    return int(dset[1])
+
+def _executable(pid):
+    with open('/proc/{}/cmdline'.format(pid), 'rb') as f:
+        data = f.read()
+    fields = data.split(b'\0')
+    if b'/' in fields[0]:
+        return fields[0].split(b'/')[-1]
+    else:
+        return fields[0]
+
+def _ppid_map():
+    # lifted from psutil
+    ppids = {}
+    for pid in os.listdir('/proc/'):
+        if pid.isdigit():
+            ppids[int(pid)] = _ppid(int(pid))
+    return ppids
+
+def _service_pids(root_pid):
+    """Gather PIDs that are descendants of root_pid, but whose direct parent is action-suid. These are processes started with `singularity run`."""
+    def _gather_leaves(root_pid, parent_map, child_map):
+        if _executable(parent_map[root_pid]) == b'action-suid':
+            return [root_pid]
+        elif root_pid in child_map:
+            return sum([_gather_leaves(c, parent_map, child_map) for c in child_map[root_pid]], [])
+        else:
+            return []
+    parent_map = _ppid_map()
+    child_map = {}
+    for c, p in parent_map.items():
+        if not p in child_map:
+            child_map[p] = []
+        child_map[p].append(c)
+    return _gather_leaves(root_pid, parent_map, child_map)
+
+def _get_environment(app, name):
+    """Retrieve the environment variables for a running service"""
+    # get PID of service daemon
+    with open(_pid_file(app, name), 'rb') as f:
+        pid = int(f.read())
+    # get PID of a replica process
+    children = _service_pids(pid)
+    with open('/proc/{}/environ'.format(children[0]), 'rb') as f:
+        data = f.read()
+    env = {}
+    for field in data.split(b'\0'):
+        i = field.find(b'=')
+        k, v = field[:i], field[i+1:]
+        env[b'SINGULARITYENV_'+k] = v
+    return env
+
+def exec(args):
+    """
+    Execute a program in the container of the given service, with its environment variables
+    """
+    stacks = StackCache()
+    config = stacks[args.name]
+    del stacks
+    instance = _instance_name(args.name, args.service, 0)
+    os.execvpe('singularity',
+        ['singularity', 'exec', '--cleanenv', 'instance://{}'.format(instance)] +  args.cmd,
+        _get_environment(args.name, args.service))
+
 def main():
     from argparse import ArgumentParser, ArgumentDefaultsHelpFormatter
     parser = ArgumentParser(prog='singularity-stack', description=__doc__, formatter_class=ArgumentDefaultsHelpFormatter)
@@ -637,7 +706,7 @@ def main():
     def add_command(f, name=None, needs_name=True):
         if name is None:
             name = f.__name__
-        p = subparsers.add_parser(name)
+        p = subparsers.add_parser(name, help=f.__doc__)
         p.set_defaults(func=f)
         if needs_name:
             p.add_argument('name', help="name of stack (argument passed to `singularity-stack deploy`")
@@ -652,6 +721,10 @@ def main():
 
     p = add_command(stop)
     p.add_argument('service')
+
+    p = add_command(exec)
+    p.add_argument('service')
+    p.add_argument('cmd', nargs='+')
 
     p = add_command(rm)
 
