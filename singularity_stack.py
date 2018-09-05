@@ -68,7 +68,7 @@ def _bind_secret(name, config):
     secret = config['secrets'][name]['file']
     perms = os.stat(secret).st_mode
     if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
-        raise ValueError("Secrets file '{}' should be readable only by its owner")
+        raise ValueError("Secrets file '{}' should be readable only by its owner".format(secret))
     if overlayfs_is_broken:
         return []
     else:
