@@ -8,6 +8,8 @@ import yaml
 import json
 import daemon
 import daemon.pidfile
+import datetime
+import dateutil.parser
 import sys, os, stat, shutil
 import warnings
 import re
@@ -607,7 +609,7 @@ def logs(args):
     path = _log_prefix(args.name, args.service)+".json"
     f = open(path, "rb")
     size = os.stat(path).st_size
-    if args.follow:
+    if args.follow and args.since is None:
         # start 1 kB from the end of the file
         offset = -min((1024, size))
         f.seek(offset, 2)
@@ -629,6 +631,8 @@ def logs(args):
        try:
            payload = json.loads(line.decode('utf-8'))
        except json.decoder.JSONDecodeError:
+           continue
+       if args.since is not None and payload['timestamp'] < args.since:
            continue
        if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
            continue
@@ -742,12 +746,29 @@ def main():
     p = add_command(rm)
 
     p = add_command(logs)
+    def parse_timedelta(value):
+        now = datetime.datetime.now()
+        if value.endswith('s'):
+            return datetime.timedelta(seconds=float(value[:-1]))
+        elif value.endswith('m'):
+            return datetime.timedelta(seconds=60*float(value[:-1]))
+        elif value.endswith('h'):
+            return datetime.timedelta(seconds=3600*float(value[:-1]))
+        elif value.endswith('d'):
+            return datetime.timedelta(days=float(value[:-1]))
+        else:
+            raise ValueError('Unrecognized time interval "{}"'.format(value))
+    def get_timestamp(value):
+        try:
+            return (datetime.datetime.now() - parse_timedelta(value)).timestamp()
+        except ValueError:
+            return dateutil.parser.parse(value).timestamp()
     p.add_argument('service', default=None, nargs='?', type=str, help='Dump logs for this service only')
     p.add_argument('replica', default=None, nargs='?', type=int, help='Dump logs for this replica only')
     p.add_argument('-f', '--follow', default=False, action="store_true", help='Follow log output')
+    p.add_argument('--since', default=None, type=get_timestamp, help='Show logs since relative time (e.g. 1d, 1.2h, 5m, 30s)')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
-
 
     subvolume = subparsers.add_parser('volume', help=_init_volume.__doc__).add_subparsers()
     p = subvolume.add_parser('init', description='initialize a singularity-stack volume by copying a path from the image to the host filesystem.')
