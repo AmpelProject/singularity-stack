@@ -243,6 +243,15 @@ def _start_replica_set(app, name, configs):
         log.debug('exiting')
         sys.exit(0)
 
+from logging.handlers import TimedRotatingFileHandler
+class LogRotator(TimedRotatingFileHandler):
+    def emit(self, record):
+        if self.shouldRollover(record):
+            self.doRollover()
+        json.dump(record, self.stream)
+        self.stream.write('\n')
+        self.stream.flush()
+
 class LogEmitter:
     def __init__(self, queue, **kwargs):
         self._queue = queue
@@ -256,10 +265,10 @@ class LogEmitter:
         self._queue.put(payload)
 
 class LogCollector:
-    def __init__(self, queue, procs, outfile):
+    def __init__(self, queue, procs, handler):
         self._queue = queue
         self._procs = procs
-        self._file = outfile
+        self._handler = handler
     def run(self):
         log.debug('collecting logs')
         for proc in self._procs.values():
@@ -280,16 +289,14 @@ class LogCollector:
                 self._procs[msg].join()
                 del self._procs[msg]
             else:
-                json.dump(msg, self._file)
-                self._file.write('\n')
-                self._file.flush()
+                self._handler.emit(msg)
 
 def _run_replica_set(app, name, configs):
     replicas = len(configs)
     queue = multiprocessing.Queue()
-    outfile = open(_log_prefix(app, name)+".json", "w", encoding="utf-8")
     procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
-    collector = LogCollector(queue, procs, outfile)
+    handler = LogRotator(_log_prefix(app, name)+".json", "midnight", encoding="utf-8")
+    collector = LogCollector(queue, procs, handler)
     #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
     collector.run()
 
