@@ -111,6 +111,22 @@ def init_volume_cmd(args):
         raise FileExistsError("Destination path {} already exists. Pass --force to overwrite".format(args.dest))
     _init_volume(args.image, args.dest, args.source)
 
+def _parse_volume(volume):
+    if isinstance(volume, str):
+        if ':' in volume:
+            source, dest = volume.split(':')
+        else:
+            source, dest = volume, volume
+        if source.startswith('.') or source.startswith('/') and ':' in volume:
+            voltype = 'bind'
+        else:
+            voltype = 'volume'
+        return dict(type=voltype, source=source, target=dest)
+    elif isinstance(volume, dict):
+        return volume
+    else:
+        raise TypeError
+
 def singularity_command_line(name, config):
     """
     Start a Singularity instance from the given Docker service definition
@@ -128,30 +144,18 @@ def singularity_command_line(name, config):
     service['_tempfiles'] = list()
     
     # Mount volumes
-    for volume in service.get('volumes', []):
-        if isinstance(volume, str):
-            if ':' in volume:
-                source, dest = volume.split(':')
-            else:
-                source, dest = volume, volume
-            if source.startswith('.') or source.startswith('/') and ':' in volume:
-                voltype = 'bind'
-            else:
-                voltype = 'volume'
-            volume = dict(type=voltype, source=source, target=dest)
-            
-        if isinstance(volume, dict):
-            if volume['type'] == 'volume':
-                _init_volume(singularity_image(service['image']), volume['source'], volume['target'])
-                cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
-            elif volume['type'] == 'tmpfs':
-                tempdir = tempfile.mkdtemp(dir='/dev/shm/')
-                service['_tempfiles'].append(tempdir)
-                cmd += ['-B', '{}:{}'.format(tempdir, volume['target'])]
-            elif volume['type'] == 'bind':
-                cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
-            else:
-                raise ValueError("Unsupported volume type '{}'".format(volume['type']))
+    for volume in map(_parse_volume, service.get('volumes', [])):
+        if volume['type'] == 'volume':
+            _init_volume(singularity_image(service['image']), volume['source'], volume['target'])
+            cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
+        elif volume['type'] == 'tmpfs':
+            tempdir = tempfile.mkdtemp(dir='/dev/shm/')
+            service['_tempfiles'].append(tempdir)
+            cmd += ['-B', '{}:{}'.format(tempdir, volume['target'])]
+        elif volume['type'] == 'bind':
+            cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
+        else:
+            raise ValueError("Unsupported volume type '{}'".format(volume['type']))
     
     # Fill and bind /etc/hosts file
     with tempfile.NamedTemporaryFile(mode='wt', delete=False) as hosts:
@@ -557,6 +561,12 @@ def update(args):
     """[Re]start a single service"""
     stacks = StackCache()
     config = stacks[args.name]
+    service = config['services'][args.service]
+    if args.volume:
+        volumes = {v['target']: v for v in map(_parse_volume, service['volumes'])}
+        for v in map(_parse_volume, args.volume):
+            volumes[v['target']] = v
+        service['volumes'] = list(volumes.values())
     del stacks
     _start_service(args.name, args.service, config)
 
@@ -693,7 +703,7 @@ def _get_environment(app, name):
     children = _service_pids(pid)
     with open('/proc/{}/environ'.format(children[0]), 'rb') as f:
         data = f.read()
-    env = {}
+    env = dict(os.environ)
     for field in data.split(b'\0'):
         i = field.find(b'=')
         k, v = field[:i], field[i+1:]
@@ -735,6 +745,7 @@ def main():
 
     p = add_command(update)
     p.add_argument('service')
+    p.add_argument('--volume', default=[], action='append', help='Add or replace a volume mount')
 
     p = add_command(stop)
     p.add_argument('service')
