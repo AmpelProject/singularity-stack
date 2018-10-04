@@ -8,6 +8,8 @@ import yaml
 import json
 import daemon
 import daemon.pidfile
+import requests
+
 import datetime
 import dateutil.parser
 import sys, os, stat, shutil
@@ -27,7 +29,7 @@ import logging
 
 log = logging.getLogger(__name__)
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 def start_order(services):
     """
@@ -315,6 +317,55 @@ def _run(app, name, replica, config, log_queue):
     finally:
         log_queue.put(replica)
 
+def _register(app, name, replica, config):
+    """
+    Mimic gliderlabs Registrator (TM)
+    """
+    if not 'x-consul' in config:
+        return
+    service = config['services'][name]
+    env = {k: str(v) for k,v in service.get('environment', {}).items()}
+    payload = {
+        'name': name,
+        'id': '.'.join([app, name, str(replica)]),
+        'meta': {}
+    }
+    prefix = 'SERVICE_'
+    for k, v in env.items():
+        if not k.startswith(prefix):
+            continue
+        key = k[len(prefix):]
+        if key.lower() in payload:
+            payload[key] = v
+        elif key.lower() == 'tags':
+            payload['tags'] = v.split(',')
+        else:
+            payload['meta'][key] = v
+    for mapping in service.get('ports', []):
+        if ':' in mapping:
+            src, dest = map(int, mapping.split(':'))
+        else:
+            src = int(mapping)
+            dest = src
+        payload['address'] = socket.gethostbyname(socket.gethostname())
+        payload['port'] = src
+        # check that the service is listening
+        payload['check'] = {
+            'id': name,
+            'tcp': '{}:{}'.format(payload['address'], payload['port']),
+            'interval': '60s',
+            'timeout': '10s',
+        }
+        # FIXME: support multiple service ports per container?
+        break
+    requests.put('{}/v1/agent/service/register'.format(config['x-consul']), json=payload).raise_for_status()
+
+def _deregister(app, name, replica, config):
+    if not 'x-consul' in config:
+        return
+    service_id = '.'.join([app, name, str(replica)])
+    requests.put('{}/v1/agent/service/deregister/{}'.format(config['x-consul'], service_id)).raise_for_status()
+
 def _run_impl(app, name, replica, config, log_queue):
     """
     Fork a daemon process that starts the service process in a Singularity
@@ -355,6 +406,7 @@ def _run_impl(app, name, replica, config, log_queue):
         stderr = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stderr")
         stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stdout")
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        _register(app, name, replica, config)
         reads = [proc.stdout.fileno(), proc.stderr.fileno()]
         while True:
             ready = select.select(reads, [], [], 1)[0]
@@ -373,6 +425,7 @@ def _run_impl(app, name, replica, config, log_queue):
                         sink.write(line.decode())
                 break
         ret = proc.wait()
+        _deregister(app, name, replica, config)
         if ret == 0 and restart_policy.get('condition', 'no') != 'any':
             break
         else:
