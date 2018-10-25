@@ -251,8 +251,8 @@ def _start_replica_set(app, name, configs):
         log.debug('exiting')
         sys.exit(0)
 
-from logging.handlers import TimedRotatingFileHandler
-class LogRotator(TimedRotatingFileHandler):
+from logging.handlers import RotatingFileHandler
+class LogRotator(RotatingFileHandler):
     def emit(self, record):
         if self.shouldRollover(record):
             self.doRollover()
@@ -303,7 +303,7 @@ def _run_replica_set(app, name, configs):
     replicas = len(configs)
     queue = multiprocessing.Queue()
     procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
-    handler = LogRotator(_log_prefix(app, name)+".json", "midnight", encoding="utf-8")
+    handler = LogRotator(_log_prefix(app, name)+".json", maxBytes=2**24, backupCount=16, encoding="utf-8")
     collector = LogCollector(queue, procs, handler)
     #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
     collector.run()
