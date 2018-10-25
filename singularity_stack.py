@@ -253,6 +253,8 @@ def _start_replica_set(app, name, configs):
 
 from logging.handlers import RotatingFileHandler
 class LogRotator(RotatingFileHandler):
+    def format(self, record):
+        return json.dumps(record)
     def emit(self, record):
         if self.shouldRollover(record):
             self.doRollover()
