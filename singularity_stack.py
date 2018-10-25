@@ -672,6 +672,7 @@ def logs(args):
         raise ValueError("I need a single service at the moment")
     else:
         names = [args.service]
+    args.exclude = [re.compile(p) for p in args.exclude]
 
     template = "{{:23s}} {{:{}s}}:{{}} {{:7s}} \u23b8 ".format(max(map(len, names)))
 
@@ -706,6 +707,8 @@ def logs(args):
        if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
            continue
        if (args.replica is not None and payload.get('replica', None) != args.replica):
+           continue
+       if any(p.match(payload['msg']) for p in args.exclude):
            continue
        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(payload['timestamp'])) + "{:.3f}".format(payload['timestamp'] % 1)[1:]
        sys.stdout.write(template.format(ts, args.service, payload.get('replica', 0), payload['source']))
@@ -842,6 +845,7 @@ def main():
     p.add_argument('--since', default=None, type=get_timestamp, help='Show logs since relative time (e.g. 1d, 1.2h, 5m, 30s)')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
+    p.add_argument('-x', '--exclude', default=[], action="append", help='Exclude lines matching this pattern')
 
     subvolume = subparsers.add_parser('volume', help=_init_volume.__doc__).add_subparsers()
     p = subvolume.add_parser('init', description='initialize a singularity-stack volume by copying a path from the image to the host filesystem.')
