@@ -630,6 +630,12 @@ def stop(args):
     del stacks
     _stop(args.name, args.service, config)
 
+def load(args):
+    """load and cache a stack"""
+    stacks = StackCache()
+    config = stacks.add(args.name, args.compose_file)
+    del stacks
+
 def deploy(args):
     """[Re]start all services in the stack"""
     stacks = StackCache()
@@ -794,6 +800,9 @@ def main():
 
     add_command(list_stacks, 'list', False)
     p = add_command(deploy)
+    p.add_argument('-c', '--compose-file', type=str, default=None)
+
+    p = add_command(load)
     p.add_argument('-c', '--compose-file', type=str, default=None)
 
     p = add_command(update)
