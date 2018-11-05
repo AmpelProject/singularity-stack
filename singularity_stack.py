@@ -670,6 +670,67 @@ def rm(args):
         _stop(app, name, config)
     stacks.remove(app)
 
+def _last_line(fileobj):
+    fileobj.seek(-2, os.SEEK_END)
+    while fileobj.read(1) != b'\n':
+        fileobj.seek(-2, os.SEEK_CUR)
+    return fileobj.readline()
+
+def _last_timestamp(fname):
+    with open(fname, 'rb') as f:
+        line = _last_line(f)
+    try:
+        payload = json.loads(line.decode('utf-8'))
+    except json.decoder.JSONDecodeError:
+        return None
+    return payload['timestamp']
+
+def _get_log_files(args):
+    prefix = _log_prefix(args.name, args.service)+".json"
+    files = [prefix]
+    rotation = 1
+    while True:
+        fname = prefix + ".{}".format(rotation)
+        if os.path.exists(fname):
+            files.append(fname)
+        else:
+            break
+        rotation += 1
+    if args.since is not None:
+        return [f for f in reversed(files) if _last_timestamp(f) >= args.since]
+    elif args.follow:
+        return files[:1]
+    else:
+        return list(reversed(files))
+
+def _get_log_lines(args):
+    files = _get_log_files(args)
+    # all but last file are assumed to be complete
+    for fname in files[:-1]:
+        with open(fname, 'rb') as f:
+            while True:
+                 line = f.readline()
+                 if len(line) == 0:
+                     break
+                 else:
+                     yield line
+    # last file may be followed
+    with open(files[-1], 'rb') as f:
+        if args.follow and args.since is None:
+            yield _last_line(f)
+        while True:
+            line = f.readline()
+            if len(line) == 0:
+                 if args.follow:
+                      try:
+                          time.sleep(0.5)
+                      except KeyboardInterrupt:
+                          break
+                      continue
+                 else:
+                      break
+            yield line
+
 def logs(args):
     """View service logs"""
     config = StackCache.load()[args.name]
@@ -686,28 +747,7 @@ def logs(args):
 
     template = "{{:23s}} {{:{}s}}:{{}} {{:7s}} \u23b8 ".format(max(map(len, names)))
 
-    path = _log_prefix(args.name, args.service)+".json"
-    f = open(path, "rb")
-    size = os.stat(path).st_size
-    if args.follow and args.since is None:
-        # start 1 kB from the end of the file
-        offset = -min((1024, size))
-        f.seek(offset, 2)
-        # consume the partial line
-        f.readline()
-    i = 0
-    while True:
-       line = f.readline()
-       if len(line) == 0:
-           if not args.follow:
-               break
-           else:
-               try:
-                   time.sleep(0.5)
-               except KeyboardInterrupt:
-                   break
-               continue
-       i += 1
+    for line in _get_log_lines(args):
        try:
            payload = json.loads(line.decode('utf-8'))
        except json.decoder.JSONDecodeError:
