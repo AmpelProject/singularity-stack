@@ -685,6 +685,15 @@ def _last_timestamp(fname):
         return None
     return payload['timestamp']
 
+def _first_timestamp(fname):
+    with open(fname, 'rb') as f:
+        line = f.readline()
+    try:
+        payload = json.loads(line.decode('utf-8'))
+    except json.decoder.JSONDecodeError:
+        return None
+    return payload['timestamp']
+
 def _get_log_files(args):
     prefix = _log_prefix(args.name, args.service)+".json"
     files = [prefix]
@@ -696,8 +705,9 @@ def _get_log_files(args):
         else:
             break
         rotation += 1
-    if args.since is not None:
-        return [f for f in reversed(files) if _last_timestamp(f) >= args.since]
+    in_range = lambda f: (args.since is None or _last_timestamp(f) >= args.since) and (args.until is None or _first_timestamp(f) < args.until)
+    if args.since is not None or args.until is not None:
+        return [f for f in reversed(files) if in_range(f)]
     elif args.follow:
         return files[:1]
     else:
@@ -753,6 +763,8 @@ def logs(args):
        except json.decoder.JSONDecodeError:
            continue
        if args.since is not None and payload['timestamp'] < args.since:
+           continue
+       if args.until is not None and payload['timestamp'] > args.until:
            continue
        if (not args.stderr and payload['source'] == 'stderr') or (not args.stdout and payload['source'] == 'stdout'):
            continue
@@ -893,6 +905,7 @@ def main():
     p.add_argument('replica', default=None, nargs='?', type=int, help='Dump logs for this replica only')
     p.add_argument('-f', '--follow', default=False, action="store_true", help='Follow log output')
     p.add_argument('--since', default=None, type=get_timestamp, help='Show logs since relative time (e.g. 1d, 1.2h, 5m, 30s)')
+    p.add_argument('--until', default=None, type=get_timestamp, help='Show logs until relative time (e.g. 1d, 1.2h, 5m, 30s)')
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
     p.add_argument('-x', '--exclude', default=[], action="append", help='Exclude lines matching this pattern')
