@@ -715,6 +715,8 @@ def _get_log_files(args):
 
 def _get_log_lines(args):
     files = _get_log_files(args)
+    if len(files) == 0:
+         return
     # all but last file are assumed to be complete
     for fname in files[:-1]:
         with open(fname, 'rb') as f:
