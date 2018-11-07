@@ -796,12 +796,16 @@ def _executable(pid):
         return fields[0]
 
 def _ppid_map():
+    if _ppid_map.ppids:
+        return _ppid_map.ppids
     # lifted from psutil
     ppids = {}
     for pid in os.listdir('/proc/'):
         if pid.isdigit():
             ppids[int(pid)] = _ppid(int(pid))
+    _ppid_map.ppids = ppids
     return ppids
+_ppid_map.ppids = None
 
 def _service_pids(root_pid):
     """Gather PIDs that are descendants of root_pid, but whose direct parent is action-suid. These are processes started with `singularity run`."""
