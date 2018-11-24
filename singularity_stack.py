@@ -633,6 +633,16 @@ def update(args):
     del stacks
     _start_service(args.name, args.service, config)
 
+def scale(args):
+    """Scale a single service"""
+    # FIXME: actually start or shut down replicas, rather than shutting down and restarting all of them
+    stacks = StackCache()
+    config = stacks[args.name]
+    service = config['services'][args.service]
+    service['deploy']['replicas'] = args.replicas
+    del stacks
+    _start_service(args.name, args.service, config)
+
 def stop(args):
     """Stop a single service"""
     stacks = StackCache()
@@ -887,6 +897,10 @@ def main():
 
     p = add_command(stop)
     p.add_argument('service')
+
+    p = add_command(scale)
+    p.add_argument('service')
+    p.add_argument('replicas', type=int)
 
     p = add_command(exec)
     p.add_argument('service')
