@@ -775,8 +775,11 @@ def logs(args):
        if any(p.match(payload['msg']) for p in args.exclude):
            continue
        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(payload['timestamp'])) + "{:.3f}".format(payload['timestamp'] % 1)[1:]
-       sys.stdout.write(template.format(ts, args.service, payload.get('replica', 0), payload['source']))
-       print(payload['msg'])
+       try:
+           sys.stdout.write(template.format(ts, args.service, payload.get('replica', 0), payload['source']))
+           print(payload['msg'])
+       except BrokenPipeError:
+           break
 
 def _ppid(pid):
     # lifted from psutil
