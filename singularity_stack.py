@@ -858,7 +858,8 @@ def main():
     parser.add_argument('--version', action='version', version='singularity-stack {}'.format(__version__))
     parser.add_argument('--debug', action='store_true', default=False)
 
-    subparsers = parser.add_subparsers(help='command help')
+    subparsers = parser.add_subparsers(help='command help', dest='command')
+    subparsers.required = True
 
     def add_command(f, name=None, needs_name=True):
         if name is None:
