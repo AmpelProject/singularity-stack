@@ -756,6 +756,7 @@ def logs(args):
     else:
         names = [args.service]
     args.exclude = [re.compile(p) for p in args.exclude]
+    args.include = [re.compile(p) for p in args.include]
 
     template = "{{:23s}} {{:{}s}}:{{}} {{:7s}} \u23b8 ".format(max(map(len, names)))
 
@@ -772,7 +773,7 @@ def logs(args):
            continue
        if (args.replica is not None and payload.get('replica', None) != args.replica):
            continue
-       if any(p.match(payload['msg']) for p in args.exclude):
+       if any(p.match(payload['msg']) for p in args.exclude) or not all(p.match(payload['msg']) for p in args.include):
            continue
        ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(payload['timestamp'])) + "{:.3f}".format(payload['timestamp'] % 1)[1:]
        try:
@@ -919,6 +920,7 @@ def main():
     p.add_argument('--stdout', default=False, action="store_true", help='Dump only stdout')
     p.add_argument('--stderr', default=False, action="store_true", help='Dump only stderr')
     p.add_argument('-x', '--exclude', default=[], action="append", help='Exclude lines matching this pattern')
+    p.add_argument('-i', '--include', default=[], action="append", help='Include lines matching this pattern. Multiple -i will be ANDed together.')
 
     subvolume = subparsers.add_parser('volume', help=_init_volume.__doc__).add_subparsers()
     p = subvolume.add_parser('init', description='initialize a singularity-stack volume by copying a path from the image to the host filesystem.')
