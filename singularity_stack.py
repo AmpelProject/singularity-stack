@@ -25,11 +25,12 @@ import asyncio
 import pathlib
 import socket
 import multiprocessing
+import threading
 import logging
 
 log = logging.getLogger(__name__)
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 def start_order(services):
     """
@@ -210,8 +211,9 @@ def _instance_running(name):
         stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret == 0
 
-def _start_replica_set(app, name, configs):
-    service = configs[0]['services'][name]
+def _start_replica_set(app, name, config):
+    service = config['services'][name]
+    replicas = int(service.get('deploy', {}).get('replicas', 1))
 
     # in parent process, wait for service to start listening on exposed ports
     if os.fork() != 0:
@@ -237,7 +239,7 @@ def _start_replica_set(app, name, configs):
                 raise CalledProcessError('{}.{} failed to start'.format(app, name))
             log.info('connected to {}:{}'.format(socket.gethostname(), dest))
 
-        log.info("Started {}.{} (x{})".format(app, name, len(configs)))
+        log.info("Started {}.{} (x{})".format(app, name, replicas))
 
         return True
     # in child process, do actual work
@@ -247,9 +249,16 @@ def _start_replica_set(app, name, configs):
         pidfile = daemon.pidfile.PIDLockFile(_pid_file(app, name))
         with daemon.DaemonContext(pidfile=pidfile, stderr=logfile, stdout=logfile, working_directory=os.getcwd()):
             log.debug('entered daemon context')
-            _run_replica_set(app, name, configs)
+            _run_replica_set(app, name, config, replicas)
         log.debug('exiting')
         sys.exit(0)
+
+def _run_replica_set(app, name, config, replicas=1):
+    controller = ReplicaSetController(app, name, config)
+    for _ in range(replicas):
+        controller.start_replica()
+    #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
+    controller.run()
 
 from logging.handlers import RotatingFileHandler
 class LogRotator(RotatingFileHandler):
@@ -274,41 +283,144 @@ class LogEmitter:
         payload.update(self.extra)
         self._queue.put(payload)
 
-class LogCollector:
-    def __init__(self, queue, procs, handler):
-        self._queue = queue
-        self._procs = procs
-        self._handler = handler
+class ReplicaSetClient:
+    def __init__(self, app, name):
+        self._address = _log_prefix(app, name) + '.sock'
+    class MethodProxy:
+        def __init__(self, client, method):
+            self._method = method
+            self._client = client
+        def __call__(self, *args, **kwargs):
+            return self._client._call(self._method, *args, **kwargs)
+    class RemoteError(RuntimeError):
+        pass
+    def _call(self, method, *args, **kwargs):
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.connect(self._address)
+        connection.settimeout(10)
+        connection.sendall(json.dumps({'method': method, 'args': args, 'kwargs': kwargs}).encode('utf-8'))
+        response = json.loads(connection.recv(4096).decode('utf-8'))
+        if response.get('error', False):
+            raise RemoteError(response['message'])
+        else:
+            return response['result']
+
+    def __getattr__(self, meth):
+        if meth in self.__dict__:
+            return self.__dict__[meth]
+        else:
+            return self.MethodProxy(self, meth)
+
+class ReplicaSetController:
+
+    def __init__(self, app, name, config):
+        self._app = app
+        self._name = name
+        self._config = config
+        self._procs = {}
+        self._queue = multiprocessing.Queue()
+        self._handler = LogRotator(_log_prefix(app, name)+".json", maxBytes=2**24, backupCount=16, encoding="utf-8")
+        self._stop_control = threading.Event()
+        self._control_thread = threading.Thread(target=self._handle_control, args=(self._stop_control,))
+
+    def start_replica(self):
+        replica = max(self._procs.keys(), default=0)+1
+        instance = _instance_name(self._app, self._name, replica)
+        config = copy.deepcopy(self._config)
+        config['services'][self._name] = _transform_items(self._config['services'][self._name], lambda x: _sub_replica(x, replica))
+        image_spec = singularity_command_line(self._name, config)
+        if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
+            raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
+        log.debug("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
+        proc = multiprocessing.Process(target=_run, args=(self._app, self._name, replica, config, self._queue))
+        proc.start()
+        self._procs[replica] = proc
+        return instance
+
+    def stop_replica(self, replica=None):
+        if replica is None:
+            try:
+                replica = max(self._procs.keys())
+            except ValueError:
+                return None
+        try:
+            # NB: run() will reap the process when it receives its sentinel
+            proc = self._procs[replica]
+            proc.terminate()
+            proc.join()
+            instance = _instance_name(self._app, self._name, replica)
+            return instance
+        except KeyError:
+            log.error("No such replica {}".format(replica))
+    
+    def stop():
+        self._stop_control.set()
+        for _ in range(len(self._procs)):
+            self.stop_replica()
+        self._control_thread.join()
+        assert len(self._procs) == 0
+
+    def scale(self, replicas):
+        for _ in range(replicas - len(self._procs)):
+            self.start_replica()
+        for _ in range(len(self._procs) - replicas):
+            self.stop_replica()
+        return len(self._procs)
+
+    def _handle_control(self, stop_event):
+        server_address = _log_prefix(self._app, self._name) + '.sock'
+        try:
+            os.unlink(server_address)
+        except OSError:
+            if os.path.exists(server_address):
+                raise
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.bind(server_address)
+            sock.listen(1)
+            while not stop_event.wait(1):
+                log.info('Listening on {}'.format(server_address))
+                try:
+                    connection, client_address = sock.accept()
+                    payload = json.loads(connection.recv(4096).decode('utf-8'))
+                    method = payload['method']
+                    if method not in {'scale'}:
+                        response = {'error': True, 'msg': 'Unsafe method {}'.format(method)}
+                    else:
+                        try:
+                            log.info('calling {}'.format(payload))
+                            result = getattr(self, method)(*payload.get('args', []), **payload.get('kwargs', {}))
+                            response = {'result': result}
+                        except Exception as e:
+                            response = {'error': True, 'msg': str(e)}
+                    log.info('response: {}'.format(response))
+                    ret = connection.sendall(json.dumps(response).encode('utf-8'))
+                    log.info('sent: {}'.format(ret))
+                    
+                    connection.close()
+                except Exception as e:
+                    pass
+        finally:
+            os.unlink(server_address)
+
     def run(self):
         log.debug('collecting logs')
-        for proc in self._procs.values():
-            proc.start()
+        self._control_thread.start()
         while len(self._procs) > 0 or not self._queue.empty():
             try:
                 msg = self._queue.get()
             except KeyboardInterrupt:
                 log.debug('Caught SIGINT; shutting down')
-                for proc in self._procs.values():
-                    proc.terminate()
-                for proc in self._procs.values():
-                    proc.join()
+                self.stop()
                 log.debug('Shut down')
                 break
             if isinstance(msg, int):
                 # got sentinel, reap child process
-                self._procs[msg].join()
-                del self._procs[msg]
+                proc = self._procs.pop(msg)
+                proc.join()
             else:
                 self._handler.emit(msg)
-
-def _run_replica_set(app, name, configs):
-    replicas = len(configs)
-    queue = multiprocessing.Queue()
-    procs = {i: multiprocessing.Process(target=_run, args=(app, name, i, configs[i], queue)) for i in range(replicas)}
-    handler = LogRotator(_log_prefix(app, name)+".json", maxBytes=2**24, backupCount=16, encoding="utf-8")
-    collector = LogCollector(queue, procs, handler)
-    #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
-    collector.run()
 
 def _run(app, name, replica, config, log_queue):
     try:
@@ -380,6 +492,7 @@ def _run_impl(app, name, replica, config, log_queue):
     if 'restart' in service:
         raise ValueError("restart is not supported. use deploy instead")
     instance = _instance_name(app, name, replica)
+
     # NB: we assume that the default entrypoint simply calls exec on arguments
     # it does not recognize
     cmd = ['singularity', 'run', 'instance://'+instance]
@@ -409,6 +522,17 @@ def _run_impl(app, name, replica, config, log_queue):
         stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stdout")
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         _register(app, name, replica, config)
+        def handle_signal(signum, frame):
+            proc.terminate()
+            # Give the contained process 10 seconds to terminate gracefully
+            for _ in range(10):
+                if proc.poll() is not None:
+                    break
+                time.sleep(1)
+            # Pull the handbrake
+            subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
         reads = [proc.stdout.fileno(), proc.stderr.fileno()]
         while True:
             ready = select.select(reads, [], [], 1)[0]
@@ -445,6 +569,7 @@ def _run_impl(app, name, replica, config, log_queue):
             shutil.rmtree(temp)
         else:
             os.unlink(temp)
+    subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
     return ret
 
 import re
@@ -596,29 +721,12 @@ def _stop(app, name, config):
         pass
     service = config['services'][name]
     replicas = int(service.get('deploy', {}).get('replicas', 1))
-    for replica in range(replicas):
-        instance = _instance_name(app, name, replica)
-        if _instance_running(instance):
-            subprocess.check_call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-            log.info("Stopped instance {} ({}.{}.{})".format(instance, app, name, replica))
+    log.info("Stopped instance {}.{} (x{})".format(app, name, replicas))
 
 def _start_service(app, name, config):
     _stop(app, name, config)
     log.debug('Starting service {}.{}'.format(app, name))
-    service = config['services'][name]
-    replicas = int(service.get('deploy', {}).get('replicas', 1))
-    configs = []
-    for replica in range(replicas):
-        instance = _instance_name(app, name, replica)
-        myconfig = copy.deepcopy(config)
-        myconfig['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
-        configs.append(myconfig)
-        image_spec = singularity_command_line(name, myconfig)
-        if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
-            raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
-        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-        log.debug("Started instance {} ({}.{}.{})".format(instance, app, name, replica))
-    _start_replica_set(app, name, configs)
+    _start_replica_set(app, name, config)
 
 def update(args):
     """[Re]start a single service"""
@@ -635,13 +743,16 @@ def update(args):
 
 def scale(args):
     """Scale a single service"""
-    # FIXME: actually start or shut down replicas, rather than shutting down and restarting all of them
-    stacks = StackCache()
-    config = stacks[args.name]
-    service = config['services'][args.service]
-    service['deploy']['replicas'] = args.replicas
-    del stacks
-    _start_service(args.name, args.service, config)
+    try:
+        client = ReplicaSetClient(args.name, args.service)
+        print(client.scale(args.replicas))
+        stacks = StackCache()
+        config = stacks[args.name]
+        service = config['services'][args.service]
+        service['deploy']['replicas'] = args.replicas
+        del stacks
+    except:
+        raise
 
 def stop(args):
     """Stop a single service"""
