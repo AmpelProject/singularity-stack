@@ -973,7 +973,7 @@ def exec(args):
     stacks = StackCache()
     config = stacks[args.name]
     del stacks
-    instance = _instance_name(args.name, args.service, 0)
+    instance = _instance_name(args.name, args.service, 1)
     os.execvpe('singularity',
         ['singularity', 'exec', '--cleanenv', 'instance://{}'.format(instance)] +  args.cmd,
         _get_environment(args.name, args.service))
