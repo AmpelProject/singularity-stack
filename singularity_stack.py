@@ -331,6 +331,7 @@ class ReplicaSetController:
         image_spec = singularity_command_line(self._name, config)
         if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
             raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+        subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
         log.debug("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
         proc = multiprocessing.Process(target=_run, args=(self._app, self._name, replica, config, self._queue))
@@ -354,7 +355,7 @@ class ReplicaSetController:
         except KeyError:
             log.error("No such replica {}".format(replica))
     
-    def stop():
+    def stop(self):
         self._stop_control.set()
         for _ in range(len(self._procs)):
             self.stop_replica()
@@ -706,7 +707,7 @@ def _stop(app, name, config):
     try:
         with open(_pid_file(app,name), 'r') as pidfile:
             pid = int(pidfile.read())
-            log.debug('Killing process {}'.format(pid))
+            log.info('Killing process {}'.format(pid))
             try:
                 os.kill(pid, signal.SIGINT)
             except:
@@ -717,11 +718,11 @@ def _stop(app, name, config):
                     time.sleep(1)
                 except Exception as e:
                     break
+        service = config['services'][name]
+        replicas = int(service.get('deploy', {}).get('replicas', 1))
+        log.info("Stopped instance {}.{} (x{})".format(app, name, replicas))
     except FileNotFoundError:
         pass
-    service = config['services'][name]
-    replicas = int(service.get('deploy', {}).get('replicas', 1))
-    log.info("Stopped instance {}.{} (x{})".format(app, name, replicas))
 
 def _start_service(app, name, config):
     _stop(app, name, config)
