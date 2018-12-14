@@ -333,7 +333,7 @@ class ReplicaSetController:
             raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
         subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-        log.debug("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
+        log.info("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
         proc = multiprocessing.Process(target=_run, args=(self._app, self._name, replica, config, self._queue))
         proc.start()
         self._procs[replica] = proc
@@ -348,19 +348,23 @@ class ReplicaSetController:
         try:
             # NB: run() will reap the process when it receives its sentinel
             proc = self._procs[replica]
+            pid = proc.pid
             proc.terminate()
+            log.info("Waiting for pid {} ({}.{}.{})".format(pid, self._app, self._name, replica))
             proc.join()
             instance = _instance_name(self._app, self._name, replica)
+            log.info("Stopped instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
             return instance
         except KeyError:
             log.error("No such replica {}".format(replica))
-    
-    def stop(self):
+
+    def _stop(self):
         self._stop_control.set()
-        for _ in range(len(self._procs)):
-            self.stop_replica()
         self._control_thread.join()
-        assert len(self._procs) == 0
+        log.debug("Control thread stopped")
+        for i in list(self._procs.keys()):
+            proc = self._procs[i]
+            proc.terminate()
 
     def scale(self, replicas):
         for _ in range(replicas - len(self._procs)):
@@ -379,11 +383,15 @@ class ReplicaSetController:
         try:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             sock.bind(server_address)
+            sock.settimeout(1)
             sock.listen(1)
-            while not stop_event.wait(1):
-                log.info('Listening on {}'.format(server_address))
+            log.info('Listening on {}'.format(server_address))
+            while not stop_event.is_set():
                 try:
                     connection, client_address = sock.accept()
+                except socket.timeout:
+                    continue
+                try:
                     connection.settimeout(10)
                     payload = json.loads(connection.recv(4096).decode('utf-8'))
                     method = payload['method']
@@ -408,22 +416,33 @@ class ReplicaSetController:
             os.unlink(server_address)
 
     def run(self):
-        log.debug('collecting logs')
-        self._control_thread.start()
-        while len(self._procs) > 0 or not self._queue.empty():
-            try:
-                msg = self._queue.get()
-            except KeyboardInterrupt:
-                log.debug('Caught SIGINT; shutting down')
-                self.stop()
-                log.debug('Shut down')
-                break
-            if isinstance(msg, int):
-                # got sentinel, reap child process
-                proc = self._procs.pop(msg)
+        try:
+            log.debug('collecting logs')
+            self._control_thread.start()
+            while len(self._procs) > 0 or not self._queue.empty():
+                try:
+                    msg = self._queue.get()
+                    if isinstance(msg, int):
+                        # got sentinel, reap child process
+                        proc = self._procs.pop(msg)
+                        log.debug('Reaping proc {}'.format(msg))
+                        proc.join()
+                        log.info('Reaped proc {}'.format(msg))
+                    else:
+                        self._handler.emit(msg)
+                except KeyboardInterrupt:
+                    log.info('Caught SIGINT; shutting down')
+                    self._stop()
+            log.info('Shut down')
+        except:
+            for proc in self._procs.values():
+                # no child left behind
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
                 proc.join()
-            else:
-                self._handler.emit(msg)
+            raise
 
 def _run(app, name, replica, config, log_queue):
     try:
@@ -514,25 +533,31 @@ def _run_impl(app, name, replica, config, log_queue):
     max_attempts = 0
     if restart_policy.get('condition','no') in {'on-failure', 'any'}:
         max_attempts = restart_policy.get('max_attempts', sys.maxsize)
-    delay = _parse_duration(restart_policy.get('delay', ''))
+    restart_policy['delay'] = _parse_duration(restart_policy.get('delay', ''))
     
     ret = 0
     for _ in range(-1, max_attempts):
         if not _instance_running(instance):
             print('{} instance is gone!'.format(instance))
-            return 1
+            ret = 1
+            break
         stderr = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stderr")
         stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stdout")
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         _register(app, name, replica, config)
         def handle_signal(signum, frame):
             proc.terminate()
+            print('Terminating on signal {}'.format(signum))
             # Give the contained process 10 seconds to terminate gracefully
-            for _ in range(10):
+            for i in range(100):
                 if proc.poll() is not None:
+                    print('Child process exited after {} s'.format(i*0.1))
                     break
-                time.sleep(1)
-            # Pull the handbrake
+                time.sleep(0.1)
+            else:
+                print('Hard-killing instance {}'.format(instance))
+            restart_policy['delay'] = 0
+            # Pull the handbrake. This will also cause the restart loop to terminate.
             subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         signal.signal(signal.SIGINT, handle_signal)
         signal.signal(signal.SIGTERM, handle_signal)
@@ -558,8 +583,8 @@ def _run_impl(app, name, replica, config, log_queue):
         if ret == 0 and restart_policy.get('condition', 'no') != 'any':
             break
         else:
-            print('sleeping {} before restart'.format(delay))
-            time.sleep(delay)
+            print('sleeping {} before restart'.format(restart_policy['delay']))
+            time.sleep(restart_policy['delay'])
     if ret != 0:
         print('failed permanently with status {}'.format(ret))
     else:
