@@ -384,6 +384,7 @@ class ReplicaSetController:
                 log.info('Listening on {}'.format(server_address))
                 try:
                     connection, client_address = sock.accept()
+                    connection.settimeout(10)
                     payload = json.loads(connection.recv(4096).decode('utf-8'))
                     method = payload['method']
                     if method not in {'scale'}:
@@ -401,6 +402,7 @@ class ReplicaSetController:
                     
                     connection.close()
                 except Exception as e:
+                    log.error(e)
                     pass
         finally:
             os.unlink(server_address)
