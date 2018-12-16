@@ -855,12 +855,11 @@ def _get_log_files(args):
             break
         rotation += 1
     in_range = lambda f: (args.since is None or _last_timestamp(f) >= args.since) and (args.until is None or _first_timestamp(f) < args.until)
-    if args.since is not None or args.until is not None:
-        return [f for f in reversed(files) if in_range(f)]
-    elif args.follow:
+    selected = list(filter(in_range, reversed(files)))
+    if args.follow and not selected:
         return files[:1]
     else:
-        return list(reversed(files))
+        return selected
 
 def _get_log_lines(args):
     files = _get_log_files(args)
