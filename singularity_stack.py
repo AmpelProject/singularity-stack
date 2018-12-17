@@ -24,8 +24,6 @@ import tempfile
 import asyncio
 import pathlib
 import socket
-import multiprocessing
-import threading
 import logging
 
 log = logging.getLogger(__name__)
@@ -258,7 +256,14 @@ def _run_replica_set(app, name, config, replicas=1):
     for _ in range(replicas):
         controller.start_replica()
     #sys.stderr = sys.stdout = LogEmitter(queue, app=app, service=name, source="collector")
-    controller.run()
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.run_until_complete(controller.stop())
+    loop.close()
 
 from logging.handlers import RotatingFileHandler
 class LogRotator(RotatingFileHandler):
@@ -272,8 +277,8 @@ class LogRotator(RotatingFileHandler):
         self.stream.flush()
 
 class LogEmitter:
-    def __init__(self, queue, **kwargs):
-        self._queue = queue
+    def __init__(self, handler, **kwargs):
+        self._handler = handler
         self.extra = kwargs
     def write(self, msg):
         msg = msg.rstrip()
@@ -281,7 +286,7 @@ class LogEmitter:
             return
         payload = dict(timestamp=time.time(), msg=msg)
         payload.update(self.extra)
-        self._queue.put(payload)
+        self._handler.emit(payload)
 
 class ReplicaSetClient:
     def __init__(self, app, name):
@@ -298,10 +303,10 @@ class ReplicaSetClient:
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.connect(self._address)
         connection.settimeout(10)
-        connection.sendall(json.dumps({'method': method, 'args': args, 'kwargs': kwargs}).encode('utf-8'))
+        connection.sendall(json.dumps({'method': method, 'args': args, 'kwargs': kwargs}).encode('utf-8')+b'\n')
         response = json.loads(connection.recv(4096).decode('utf-8'))
         if response.get('error', False):
-            raise RemoteError(response['message'])
+            raise self.RemoteError(response['msg'])
         else:
             return response['result']
 
@@ -318,10 +323,8 @@ class ReplicaSetController:
         self._name = name
         self._config = config
         self._procs = {}
-        self._queue = multiprocessing.Queue()
         self._handler = LogRotator(_log_prefix(app, name)+".json", maxBytes=2**24, backupCount=16, encoding="utf-8")
-        self._stop_control = threading.Event()
-        self._control_thread = threading.Thread(target=self._handle_control, args=(self._stop_control,))
+        self._control = asyncio.ensure_future(asyncio.start_unix_server(self._handle_control, path=_log_prefix(self._app, self._name) + '.sock'))
 
     def start_replica(self):
         replica = max(self._procs.keys(), default=0)+1
@@ -331,127 +334,68 @@ class ReplicaSetController:
         image_spec = singularity_command_line(self._name, config)
         if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
             raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+        log.debug('starting instance {} ({}.{}.{})'.format(instance, self._app, self._name, replica))
         subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
         subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
         log.info("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
-        proc = multiprocessing.Process(target=_run, args=(self._app, self._name, replica, config, self._queue))
-        proc.start()
-        self._procs[replica] = proc
+        self._procs[replica] = ReplicaRunner(self._app, self._name, replica, config, self._handler)
         return instance
 
-    def stop_replica(self, replica=None):
+    async def stop_replica(self, replica=None):
         if replica is None:
             try:
                 replica = max(self._procs.keys())
             except ValueError:
                 return None
         try:
-            # NB: run() will reap the process when it receives its sentinel
-            proc = self._procs[replica]
-            pid = proc.pid
-            proc.terminate()
-            log.info("Waiting for pid {} ({}.{}.{})".format(pid, self._app, self._name, replica))
-            proc.join()
-            instance = _instance_name(self._app, self._name, replica)
-            log.info("Stopped instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
-            return instance
+            proc = self._procs.pop(replica)
+            await proc.stop()
         except KeyError:
             log.error("No such replica {}".format(replica))
 
-    def _stop(self):
-        self._stop_control.set()
-        self._control_thread.join()
-        log.debug("Control thread stopped")
-        for i in list(self._procs.keys()):
-            proc = self._procs[i]
-            proc.terminate()
+    async def _stop_control(self):
+        self._control.cancel()
+        control = await self._control
+        control.close()
+        return control.wait_closed()
 
-    def scale(self, replicas):
+    async def stop(self):
+        await self._stop_control()
+        log.debug("Control server closed")
+        for i in list(self._procs.keys()):
+            proc = self._procs.pop(i)
+            log.debug("stopping replica {}".format(i))
+            await proc.stop()
+
+    async def scale(self, replicas):
         for _ in range(replicas - len(self._procs)):
             self.start_replica()
-        for _ in range(len(self._procs) - replicas):
-            self.stop_replica()
+        await asyncio.gather(*[self.stop_replica() for _ in range(len(self._procs) - replicas)])
         return len(self._procs)
 
-    def _handle_control(self, stop_event):
-        server_address = _log_prefix(self._app, self._name) + '.sock'
+    async def _handle_control(self, reader, writer):
+        log.debug("new control connection")
         try:
-            os.unlink(server_address)
-        except OSError:
-            if os.path.exists(server_address):
-                raise
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.bind(server_address)
-            sock.settimeout(1)
-            sock.listen(1)
-            log.info('Listening on {}'.format(server_address))
-            while not stop_event.is_set():
+            payload = json.loads((await reader.readline()).decode('utf-8').strip())
+            log.debug("got payload")
+            method = payload['method']
+            if method not in {'scale'}:
+                response = {'error': True, 'msg': 'Unsafe method {}'.format(method)}
+            else:
                 try:
-                    connection, client_address = sock.accept()
-                except socket.timeout:
-                    continue
-                try:
-                    connection.settimeout(10)
-                    payload = json.loads(connection.recv(4096).decode('utf-8'))
-                    method = payload['method']
-                    if method not in {'scale'}:
-                        response = {'error': True, 'msg': 'Unsafe method {}'.format(method)}
-                    else:
-                        try:
-                            log.info('calling {}'.format(payload))
-                            result = getattr(self, method)(*payload.get('args', []), **payload.get('kwargs', {}))
-                            response = {'result': result}
-                        except Exception as e:
-                            response = {'error': True, 'msg': str(e)}
-                    log.info('response: {}'.format(response))
-                    ret = connection.sendall(json.dumps(response).encode('utf-8'))
-                    log.info('sent: {}'.format(ret))
-                    
-                    connection.close()
+                    log.info('calling {}'.format(payload))
+                    result = getattr(self, method)(*payload.get('args', []), **payload.get('kwargs', {}))
+                    response = {'result': (await result) if asyncio.iscoroutine(result) else result}
                 except Exception as e:
-                    log.error(e)
-                    pass
-        finally:
-            os.unlink(server_address)
-
-    def run(self):
-        try:
-            log.debug('collecting logs')
-            self._control_thread.start()
-            while len(self._procs) > 0 or not self._queue.empty():
-                try:
-                    msg = self._queue.get()
-                    if isinstance(msg, int):
-                        # got sentinel, reap child process
-                        proc = self._procs.pop(msg)
-                        log.debug('Reaping proc {}'.format(msg))
-                        proc.join()
-                        log.info('Reaped proc {}'.format(msg))
-                    else:
-                        self._handler.emit(msg)
-                except KeyboardInterrupt:
-                    log.info('Caught SIGINT; shutting down')
-                    self._stop()
-            log.info('Shut down')
-        except:
-            for proc in self._procs.values():
-                # no child left behind
-                try:
-                    os.kill(proc.pid, signal.SIGKILL)
-                except OSError:
-                    pass
-                proc.join()
-            raise
-
-def _run(app, name, replica, config, log_queue):
-    try:
-        _run_impl(app, name, replica, config, log_queue)
-    except:
-        import traceback
-        traceback.print_exc()
-    finally:
-        log_queue.put(replica)
+                    response = {'error': True, 'msg': repr(e)}
+            log.info('response: {}'.format(response))
+            ret = writer.write(json.dumps(response).encode('utf-8'))
+            writer.write(b'\n')
+            await writer.drain()
+            log.info('sent: {}'.format(ret))
+        except Exception as e:
+            log.error(e)
+            pass
 
 def _register(app, name, replica, config):
     """
@@ -502,103 +446,114 @@ def _deregister(app, name, replica, config):
     service_id = '.'.join([app, name, str(replica)])
     requests.put('{}/v1/agent/service/deregister/{}'.format(config['x-consul'], service_id)).raise_for_status()
 
-def _run_impl(app, name, replica, config, log_queue):
-    """
-    Fork a daemon process that starts the service process in a Singularity
-    instance, redirects its stdout/stderr to files, and restarts it on failure
-    according to the given `restart_policy`
-    """
-    sys.stderr = sys.stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="nanny")
+class ReplicaRunner:
+    def __init__(self, app, name, replica, config, log_handler):
+        self._app = app
+        self._name = name
+        self._replica = replica
+        self._config = config
+        self._proc = None
 
-    service = config['services'][name]
-    if 'restart' in service:
-        raise ValueError("restart is not supported. use deploy instead")
-    instance = _instance_name(app, name, replica)
+        self._stderr = LogEmitter(log_handler, app=app, service=name, replica=replica, source="stderr")
+        self._stdout = LogEmitter(log_handler, app=app, service=name, replica=replica, source="stdout")
+        self._nanny = LogEmitter(log_handler, app=app, service=name, replica=replica, source="nanny")
 
-    # NB: we assume that the default entrypoint simply calls exec on arguments
-    # it does not recognize
-    cmd = ['singularity', 'run', 'instance://'+instance]
-    if 'command' in service:
-        assert isinstance(service['command'], list)
-        cmd += service['command']
-    
-    env = {k: str(v) for k,v in service.get('environment', {}).items()}
-    if overlayfs_is_broken:
-        _env_secrets(env, config)
-    
-    restart_policy = service.get('deploy', {}).get('restart_policy', {})
-    if not restart_policy.get('condition', False) in {'on-failure', 'any', False}:
-        raise ValueError("unsupported restart condition '{}'".format(restart_policy['condition']))
-    
-    max_attempts = 0
-    if restart_policy.get('condition','no') in {'on-failure', 'any'}:
-        max_attempts = restart_policy.get('max_attempts', sys.maxsize)
-    restart_policy['delay'] = _parse_duration(restart_policy.get('delay', ''))
-    
-    ret = 0
-    for _ in range(-1, max_attempts):
-        if not _instance_running(instance):
-            print('{} instance is gone!'.format(instance))
-            ret = 1
-            break
-        stderr = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stderr")
-        stdout = LogEmitter(log_queue, app=app, service=name, replica=replica, source="stdout")
-        proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        _register(app, name, replica, config)
-        def handle_signal(signum, frame):
-            proc.terminate()
-            print('Terminating on signal {}'.format(signum))
-            # Give the contained process 10 seconds to terminate gracefully
-            for i in range(100):
-                if proc.poll() is not None:
-                    print('Child process exited after {} s'.format(i*0.1))
-                    break
-                time.sleep(0.1)
-            else:
-                print('Hard-killing instance {}'.format(instance))
-            restart_policy['delay'] = 0
-            # Pull the handbrake. This will also cause the restart loop to terminate.
-            subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-        reads = [proc.stdout.fileno(), proc.stderr.fileno()]
+        service = config['services'][name]
+        if 'restart' in service:
+            raise ValueError("restart is not supported. use deploy instead")
+        self._instance = _instance_name(self._app, self._name, self._replica)
+
+        # NB: we assume that the default entrypoint simply calls exec on arguments
+        # it does not recognize
+        self._cmd = ['singularity', 'run', 'instance://'+self._instance]
+        if 'command' in service:
+            assert isinstance(service['command'], list)
+            self._cmd += service['command']
+
+        self._env = {k: str(v) for k,v in service.get('environment', {}).items()}
+        if overlayfs_is_broken:
+            _env_secrets(self._env, config)
+
+        restart_policy = service.get('deploy', {}).get('restart_policy', {})
+        if not restart_policy.get('condition', False) in {'on-failure', 'any', False}:
+            raise ValueError("unsupported restart condition '{}'".format(restart_policy['condition']))
+
+        if restart_policy.get('condition','no') in {'on-failure', 'any'}:
+            restart_policy['max_attempts'] = restart_policy.get('max_attempts', sys.maxsize)
+        else:
+            restart_policy['max_attempts'] = 0
+        restart_policy['delay'] = _parse_duration(restart_policy.get('delay', ''))
+        self._restart_policy = restart_policy
+        self._future = asyncio.ensure_future(self._run())
+
+    async def wait(self):
+        try:
+            result = await self._future
+        finally:
+            subprocess.call(['singularity', 'instance.stop'] + [self._instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        return result
+
+    async def stop(self):
+        if self._proc is None:
+            return
+        self._restart_policy['delay'] = 0
+        self._restart_policy['max_attempts'] = 0
+        self._proc.terminate()
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=10)
+            log.debug('Exited willingly')
+        except asyncio.TimeoutError:
+            log.debug('Pulling the handbrake')
+            self._proc.kill()
+        return await self.wait()
+
+    @staticmethod
+    async def read_stream(fd, sink):
         while True:
-            ready = select.select(reads, [], [], 1)[0]
-            for fd in ready:
-                if fd == reads[0]:
-                    line = proc.stdout.readline().decode()
-                    stdout.write(line)
-                elif fd == reads[1]:
-                    line = proc.stderr.readline().decode()
-                    stderr.write(line)
-            if proc.poll() is not None:
-                # process has exited, suck pipes dry
-                for fd, sink in ((proc.stdout, stdout), (proc.stderr, stderr)):
-                    line = fd.read()
-                    if len(line) > 0:
-                        sink.write(line.decode())
+            line = await fd.readline()
+            if not line:
                 break
-        ret = proc.wait()
-        _deregister(app, name, replica, config)
-        if ret == 0 and restart_policy.get('condition', 'no') != 'any':
-            break
+            sink.write(line.decode())
+    
+    async def _run(self):
+        ret = 0
+        for _ in range(-1, self._restart_policy['max_attempts']):
+            if not _instance_running(self._instance):
+                print('{} instance is gone!'.format(self._instance), file=self._nanny)
+                ret = 1
+                break
+
+            self._proc = await asyncio.subprocess.create_subprocess_exec(self._cmd[0], *self._cmd[1:], env=self._env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+            _register(self._app, self._name, self._replica, self._config)
+
+            readers = asyncio.gather(*[self.read_stream(fd, sink) for fd, sink in ((self._proc.stdout, self._stdout), (self._proc.stderr, self._stderr))])
+            ret = await self._proc.wait()
+            for fd in self._proc.stdout, self._proc.stderr:
+                fd.feed_eof()
+            log.debug("exited")
+            await readers
+            log.debug("readers done")
+
+            _deregister(self._app, self._name, self._replica, self._config)
+            if ret == 0 and self._restart_policy.get('condition', 'no') != 'any':
+                break
+            else:
+                print('sleeping {} before restart'.format(self._restart_policy['delay']), file=self._nanny)
+                await asyncio.sleep(self._restart_policy['delay'])
+        if ret != 0:
+            print('failed permanently with status {}'.format(ret), file=self._nanny)
         else:
-            print('sleeping {} before restart'.format(restart_policy['delay']))
-            time.sleep(restart_policy['delay'])
-    if ret != 0:
-        print('failed permanently with status {}'.format(ret))
-    else:
-        print('exited cleanly')
-    for temp in service.get('_tempfiles', []):
-        if hasattr(temp, 'name'):
-            temp = getattr(temp, 'name')
-        print('removing {}'.format(temp))
-        if os.path.isdir(temp):
-            shutil.rmtree(temp)
-        else:
-            os.unlink(temp)
-    subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    return ret
+            print('exited cleanly', file=self._nanny)
+        for temp in self._config['services'][self._name].get('_tempfiles', []):
+            if hasattr(temp, 'name'):
+                temp = getattr(temp, 'name')
+            print('removing {}'.format(temp), file=self._nanny)
+            if os.path.isdir(temp):
+                shutil.rmtree(temp)
+            else:
+                os.unlink(temp)
+        return ret
 
 import re
 def expandvars(path, environ=os.environ):
