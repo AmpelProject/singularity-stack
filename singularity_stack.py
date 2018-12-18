@@ -486,23 +486,31 @@ class ReplicaRunner:
 
     async def wait(self):
         try:
+            log.debug("waiting for future")
             result = await self._future
+            log.debug("future complete")
         finally:
             subprocess.call(['singularity', 'instance.stop'] + [self._instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        log.debug("finished")
         return result
 
     async def stop(self):
-        if self._proc is None:
-            return
         self._restart_policy['delay'] = 0
         self._restart_policy['max_attempts'] = 0
-        self._proc.terminate()
         try:
-            await asyncio.wait_for(self._proc.wait(), timeout=10)
-            log.debug('Exited willingly')
-        except asyncio.TimeoutError:
-            log.debug('Pulling the handbrake')
-            self._proc.kill()
+            if self._proc is None:
+                raise ProcessLookupError
+            self._proc.terminate()
+            try:
+                await asyncio.wait_for(self._proc.wait(), timeout=10)
+                log.debug('Exited willingly')
+            except asyncio.TimeoutError:
+                log.debug('Pulling the handbrake')
+                self._proc.kill()
+        except ProcessLookupError:
+            log.debug('Process already gone')
+            pass
+
         return await self.wait()
 
     @staticmethod
