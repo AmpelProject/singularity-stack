@@ -536,9 +536,9 @@ class ReplicaRunner:
             log.debug("readers done")
 
             _deregister(self._app, self._name, self._replica, self._config)
-            if ret == 0 and self._restart_policy.get('condition', 'no') != 'any':
+            if (ret == 0 and self._restart_policy.get('condition', 'no') != 'any') or (self._restart_policy['max_attempts'] == 0):
                 break
-            else:
+            elif self._restart_policy['delay'] > 0:
                 print('sleeping {} before restart'.format(self._restart_policy['delay']), file=self._nanny)
                 await asyncio.sleep(self._restart_policy['delay'])
         if ret != 0:
