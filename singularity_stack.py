@@ -362,10 +362,8 @@ class ReplicaSetController:
     async def stop(self):
         await self._stop_control()
         log.debug("Control server closed")
-        for i in list(self._procs.keys()):
-            proc = self._procs.pop(i)
-            log.debug("stopping replica {}".format(i))
-            await proc.stop()
+        await asyncio.gather(*[p.stop() for p in self._procs.values()])
+        self._procs.clear()
 
     async def scale(self, replicas):
         for _ in range(replicas - len(self._procs)):
