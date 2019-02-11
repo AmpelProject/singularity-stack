@@ -727,6 +727,8 @@ def update(args):
         for v in map(_parse_volume, args.volume):
             volumes[v['target']] = v
         service['volumes'] = list(volumes.values())
+    if args.replicas:
+        service['deploy']['replicas'] = args.replicas
     del stacks
     _start_service(args.name, args.service, config)
 
@@ -993,6 +995,7 @@ def main():
     p = add_command(update)
     p.add_argument('service')
     p.add_argument('--volume', default=[], action='append', help='Add or replace a volume mount')
+    p.add_argument('--replicas', default=None, type=int, help='Change replication factor')
 
     p = add_command(stop)
     p.add_argument('service')
