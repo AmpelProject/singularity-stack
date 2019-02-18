@@ -670,18 +670,26 @@ def list_stacks(args):
     for name, config in stacks.items():
         if not config.get('active', False):
             continue
+        cols = [name, None, None, None]
         for i, service in enumerate(config['services'].keys()):
             reps = int(config['services'][service].get('deploy', {}).get('replicas', 1))
-            label = _instance_name(name, service, 0)
+            label = _instance_name(name, service, 1)
             try:
                 # get PID of service daemon
                 with open(_pid_file(name, service), 'rb') as f:
                     pid = int(f.read())
                 active_reps = len(_service_pids(pid))
             except FileNotFoundError:
-                continue
-            if active_reps > 0:
-                print(template.format(name if i==0 else '', service, str(active_reps) if reps > 1 else '', label))
+                active_reps = 0
+            if active_reps == 0:
+                rep_label = 'x'
+            elif active_reps > 1:
+                rep_label = str(active_reps)
+            else:
+                rep_label = ''
+            cols[1:] = service, rep_label, label
+            print(template.format(*cols))
+            cols[0] = ''
         print(template.format('-'*30, '-'*30, '-'*7, '-'*8))
 
 def _sub_replica(obj, replica):
