@@ -720,6 +720,50 @@ def _stop(app, name, config):
     except FileNotFoundError:
         pass
 
+import ast, socket, operator
+class ConstraintEvaluator(ast.NodeVisitor):
+    """
+    Implement a subset of Docker stack node placement constraints
+    """
+    _properties = {
+        'node' : {
+            'hostname': lambda : socket.gethostname().split('.')[0]
+        }
+    }
+    def __call__(self, line):
+        result = self.visit(ast.parse(line).body[0])
+        log.debug('{}: {}'.format(line, result))
+        return result
+    def generic_visit(self, node):
+        raise ValueError("Illegal operation {}".format(type(node)))
+    def visit_Eq(self, node):
+        return operator.eq
+    def visit_NotEq(self, node):
+        return operator.ne
+    def visit_Name(self, node):
+        return node.id
+    def visit_Str(self, node):
+        return node.s
+    def visit_Num(self, node):
+        return str(node.n)
+    def visit_BinOp(self, node):
+        rep = {ast.Sub: '-', ast.Add: '+'}[type(node.op)]
+        return self.visit(node.left) + rep + self.visit(node.right)
+    def visit_Compare(self, node):
+        left = self.visit(node.left)
+        return all(self.visit(op)(left, self.visit(right)) for op, right in zip(node.ops, node.comparators))
+    def visit_Attribute(self, node):
+        if isinstance(node.value, ast.Name):
+            try:
+                value = self._properties[node.value.id][node.attr]()
+            except KeyError:
+                raise ValueError("Unsupported property '{}.{}'".format(node.value.id, node.attr))
+            return value
+        else:
+            raise ValueError("Unsupported property '{}.{}'".format(node.value, node.attr))
+    def visit_Expr(self, node):
+        return self.visit(node.value)
+
 def _start_service(app, name, config):
     _stop(app, name, config)
     log.debug('Starting service {}.{}'.format(app, name))
@@ -774,6 +818,9 @@ def deploy(args):
     app = args.name
     try:
         for name in start_order(config['services']):
+            constrainer = ConstraintEvaluator()
+            if not all(constrainer(condition) for condition in config['services'][name].get('deploy', {}).get('placement', {}).get('constraints', [])):
+                continue
             _start_service(app, name, config)
     except Exception as e:
         print('caught {}, shutting down'.format(e)) 
