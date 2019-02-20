@@ -25,6 +25,7 @@ import asyncio
 import pathlib
 import socket
 import logging
+from functools import reduce
 
 log = logging.getLogger(__name__)
 
@@ -302,7 +303,6 @@ class ReplicaSetClient:
     def _call(self, method, *args, **kwargs):
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.connect(self._address)
-        connection.settimeout(10)
         connection.sendall(json.dumps({'method': method, 'args': args, 'kwargs': kwargs}).encode('utf-8')+b'\n')
         response = json.loads(connection.recv(4096).decode('utf-8'))
         if response.get('error', False):
@@ -362,8 +362,14 @@ class ReplicaSetController:
     async def stop(self):
         await self._stop_control()
         log.debug("Control server closed")
-        await asyncio.gather(*[p.stop() for p in self._procs.values()])
+        retvals = await asyncio.gather(*[p.stop() for p in self._procs.values()])
         self._procs.clear()
+        return reduce(operator.or_, retvals)
+
+    async def wait(self):
+        retvals = await asyncio.gather(*[p.wait() for p in self._procs.values()])
+        log.debug(retvals)
+        return reduce(operator.or_, retvals)
 
     async def scale(self, replicas):
         for _ in range(replicas - len(self._procs)):
@@ -377,7 +383,7 @@ class ReplicaSetController:
             payload = json.loads((await reader.readline()).decode('utf-8').strip())
             log.debug("got payload")
             method = payload['method']
-            if method not in {'scale'}:
+            if method not in {'scale', 'wait'}:
                 response = {'error': True, 'msg': 'Unsafe method {}'.format(method)}
             else:
                 try:
@@ -529,7 +535,7 @@ class ReplicaRunner:
                 ret = 1
                 break
 
-            self._proc = await asyncio.subprocess.create_subprocess_exec(self._cmd[0], *self._cmd[1:], env=self._env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self._proc = await asyncio.subprocess.create_subprocess_exec(*self._cmd, env=self._env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
             _register(self._app, self._name, self._replica, self._config)
 
@@ -797,6 +803,11 @@ def scale(args):
     except:
         raise
 
+def wait(args):
+    """Wait for a service to stop"""
+    client = ReplicaSetClient(args.name, args.service)
+    return client.wait()
+
 def stop(args):
     """Stop a single service"""
     stacks = StackCache()
@@ -1055,6 +1066,9 @@ def main():
     p = add_command(stop)
     p.add_argument('service')
 
+    p = add_command(wait)
+    p.add_argument('service')
+
     p = add_command(scale)
     p.add_argument('service')
     p.add_argument('replicas', type=int)
@@ -1105,7 +1119,7 @@ def main():
 
     logging.basicConfig(format='%(asctime)s %(filename)s:%(lineno)s (%(process)d) %(funcName)s() %(levelname)s %(message)s',
                         level='DEBUG' if opts.debug else 'INFO')
-    opts.func(opts)
+    sys.exit(opts.func(opts))
 
 if __name__ == "__main__":
     main()
