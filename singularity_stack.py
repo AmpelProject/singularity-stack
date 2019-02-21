@@ -806,7 +806,14 @@ def scale(args):
 def wait(args):
     """Wait for a service to stop"""
     client = ReplicaSetClient(args.name, args.service)
-    return client.wait()
+    for _ in range(10):
+        try:
+            return client.wait()
+        except (FileNotFoundError, ConnectionRefusedError):
+            if _ == 9:
+                raise
+            time.sleep(1)
+            continue
 
 def stop(args):
     """Stop a single service"""
