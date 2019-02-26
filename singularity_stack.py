@@ -1037,7 +1037,7 @@ def exec(args):
     del stacks
     instance = _instance_name(args.name, args.service, 1)
     os.execvpe('singularity',
-        ['singularity', 'exec', '--cleanenv', 'instance://{}'.format(instance)] +  args.cmd,
+        ['singularity', args.command, '--cleanenv', 'instance://{}'.format(instance)] +  args.cmd,
         _get_environment(args.name, args.service))
 
 def main():
@@ -1049,10 +1049,10 @@ def main():
     subparsers = parser.add_subparsers(help='command help', dest='command')
     subparsers.required = True
 
-    def add_command(f, name=None, needs_name=True):
+    def add_command(f, name=None, needs_name=True, aliases=[]):
         if name is None:
             name = f.__name__
-        p = subparsers.add_parser(name, help=f.__doc__)
+        p = subparsers.add_parser(name, help=f.__doc__, aliases=aliases)
         p.set_defaults(func=f)
         if needs_name:
             p.add_argument('name', help="name of stack (argument passed to `singularity-stack deploy`")
@@ -1080,7 +1080,7 @@ def main():
     p.add_argument('service')
     p.add_argument('replicas', type=int)
 
-    p = add_command(exec)
+    p = add_command(exec, aliases=['run'])
     p.add_argument('service')
     p.add_argument('cmd', nargs='+')
 
