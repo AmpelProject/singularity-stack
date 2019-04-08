@@ -833,6 +833,8 @@ def deploy(args):
     stacks = StackCache()
     config = stacks.add(args.name, args.compose_file)
     del stacks
+    if args.dry_run:
+        return
     app = args.name
     try:
         for name in start_order(config['services']):
@@ -1061,6 +1063,7 @@ def main():
     add_command(list_stacks, 'list', False)
     p = add_command(deploy)
     p.add_argument('-c', '--compose-file', type=str, default=None)
+    p.add_argument('--dry-run', action='store_true', default=False, help='Update stack cache, but do not actually start services')
 
     p = add_command(load)
     p.add_argument('-c', '--compose-file', type=str, default=None)
