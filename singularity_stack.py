@@ -931,7 +931,11 @@ def _get_log_lines(args):
 
 def logs(args):
     """View service logs"""
-    config = StackCache.load()[args.name]
+    try:
+        config = StackCache.load()[args.name]
+    except KeyError:
+        sys.stderr.write("Unknown stack '{}'\n".format(args.name))
+        return 1
     if not args.stderr or args.stdout:
         args.stderr = True
         args.stdout = True
@@ -940,6 +944,9 @@ def logs(args):
         names = sorted(config['services'].keys())
         raise ValueError("I need a single service at the moment")
     else:
+        if not args.service in config['services']:
+            sys.stderr.write("Stack '{}' has no service '{}'\n".format(args.name, args.service))
+            return 1
         names = [args.service]
     args.exclude = [re.compile(p) for p in args.exclude]
     args.include = [re.compile(p) for p in args.include]
