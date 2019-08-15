@@ -931,10 +931,11 @@ def _get_log_lines(args):
 
 def logs(args):
     """View service logs"""
+    stacks = StackCache.load()
     try:
-        config = StackCache.load()[args.name]
+        config = stacks[args.name]
     except KeyError:
-        sys.stderr.write("Unknown stack '{}'\n".format(args.name))
+        sys.stderr.write("Unknown stack '{}'. Available stacks are: {}\n".format(args.name, ', '.join(stacks.keys())))
         return 1
     if not args.stderr or args.stdout:
         args.stderr = True
@@ -945,7 +946,7 @@ def logs(args):
         raise ValueError("I need a single service at the moment")
     else:
         if not args.service in config['services']:
-            sys.stderr.write("Stack '{}' has no service '{}'\n".format(args.name, args.service))
+            sys.stderr.write("Stack '{}' has no service '{}'. Available services are: {}\n".format(args.name, args.service, ', '.join(config['services'].keys())))
             return 1
         names = [args.service]
     args.exclude = [re.compile(p) for p in args.exclude]
