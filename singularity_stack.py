@@ -621,7 +621,7 @@ class StackCache(dict):
         with open(cls.cache_file, "r") as fd:
             try:
                 fcntl.flock(fd, fcntl.LOCK_SH)
-                stacks = yaml.load(fd)
+                stacks = yaml.safe_load(fd)
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
         return stacks
@@ -633,7 +633,7 @@ class StackCache(dict):
             self.fd = open(self.cache_file, "a+")
         try:
             fcntl.flock(self.fd, fcntl.LOCK_EX)
-            contents = yaml.load(self.fd)
+            contents = yaml.safe_load(self.fd)
             if contents is None:
                 contents = {}
             super(StackCache, self).__init__(contents)
@@ -646,7 +646,7 @@ class StackCache(dict):
             self[name]['active'] = True
             return copy.deepcopy(self[name])
         with open(compose_file, 'rb') as f:
-            config = _transform_items(yaml.load(f), expandvars)
+            config = _transform_items(yaml.safe_load(f), expandvars)
         version = float(config.get('version', 0))
         if version < 3:
             raise ValueError("Unsupported docker-compose version '{}'".format(version))
