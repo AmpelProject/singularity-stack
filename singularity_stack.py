@@ -25,11 +25,21 @@ import asyncio
 import pathlib
 import socket
 import logging
-from functools import reduce
+from functools import reduce, lru_cache
+from collections import namedtuple
 
 log = logging.getLogger(__name__)
 
 __version__ = "0.5.0"
+
+
+Version = namedtuple('Version', ['major', 'minor', 'patch'])
+Version.parse = classmethod(lambda cls, v: cls(*(int(d) for d in re.match(r'[^0-9]*(\d+)\.(\d+)\.(\d+).*', v).groups())))
+
+@lru_cache()
+def singularity_version():
+    v = subprocess.check_output(['singularity', '--version']).decode()
+    return Version.parse(v)
 
 def start_order(services):
     """
@@ -56,15 +66,19 @@ def singularity_image(name):
         _, basename = name.split('/')
     if ':' in basename:
         basename, tag = basename.split(':')
-        basename += '-{}'.format(tag)
-    
+        if singularity_version().major < 3:
+            basename += '-{}.simg'.format(tag)
+        else:
+            basename += '_{}.sif'.format(tag)
+
     cwd = os.environ.get('SINGULARITY_CACHEDIR', os.getcwd())
-    image_path = os.path.join(cwd, basename+'.simg')
+    image_path = os.path.join(cwd, basename)
     if not os.path.isfile(image_path):
         subprocess.check_call(['singularity', 'pull', 'docker://{}'.format(name)], cwd=cwd)
     return image_path
 
-overlayfs_is_broken = True
+def overlayfs_is_broken():
+    return singularity_version().major < 3
 
 def _bind_secret(name, config):
     if not name in config.get('secrets', dict()):
@@ -73,7 +87,7 @@ def _bind_secret(name, config):
     perms = os.stat(secret).st_mode
     if (perms & stat.S_IRGRP) or (perms & stat.S_IROTH):
         raise ValueError("Secrets file '{}' should be readable only by its owner".format(secret))
-    if overlayfs_is_broken:
+    if overlayfs_is_broken():
         return []
     else:
         return ['-B', '{}:/run/secrets/{}'.format(secret, name)]
@@ -84,7 +98,7 @@ def _env_secrets(env, config):
     idiomatic uses of secrets files and place the contents in the
     environment.
     """
-    if overlayfs_is_broken:
+    if overlayfs_is_broken():
         prefix = '/run/secrets/'
         postfix = '_FILE'
         for k in list(env.keys()):
@@ -103,8 +117,13 @@ def _init_volume(image, source, target):
     pathlib.Path(source).parent.mkdir(parents=True, exist_ok=True)
     tagfile = os.path.join(source, ".singularity-stack-volume")
     if not os.path.exists(tagfile):
-        cmd = "cp -r '{}' '{}'".format("/var/singularity/mnt/final/"+target, source)
-        subprocess.check_call(["singularity", "mount", image, "sh", "-c", cmd])
+        if singularity_version().major < 3:
+            cmd = "cp -r '{}' '{}'".format("/var/singularity/mnt/final/"+target, source)
+            
+            subprocess.check_call(["singularity", "mount", image, "sh", "-c", cmd])
+        else:
+            cmd = 'cp -r {}/* {}'.format(target, "/var/singularity/mnt/final/"+source)
+            subprocess.check_call(["singularity", "exec", "-B", "{}:/var/singularity/mnt/final/{}".format(source, source), image, "sh", "-c", cmd])
         with open(tagfile, 'w') as f:
             f.write('{}:{}'.format(image,target))
 
@@ -151,7 +170,8 @@ def singularity_command_line(name, config):
             _init_volume(singularity_image(service['image']), volume['source'], volume['target'])
             cmd += ['-B', '{}:{}'.format(volume['source'], volume.get('target', volume['source']))]
         elif volume['type'] == 'tmpfs':
-            tempdir = tempfile.mkdtemp(dir='/dev/shm/')
+            # tempdir = tempfile.mkdtemp(dir='/dev/shm/')
+            tempdir = tempfile.mkdtemp(dir='/var/tmp/')
             service['_tempfiles'].append(tempdir)
             cmd += ['-B', '{}:{}'.format(tempdir, volume['target'])]
         elif volume['type'] == 'bind':
@@ -203,12 +223,6 @@ def _log_prefix(*args):
 
 def _pid_file(*args):
     return '/var/tmp/{}_{}.pid'.format(getpass.getuser(), '_'.join(args))
-
-def _instance_running(name):
-    # FIXME: make this check for an exact match
-    ret = subprocess.call(['singularity', 'instance.list', name],
-        stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-    return ret == 0
 
 def _start_replica_set(app, name, config):
     service = config['services'][name]
@@ -326,18 +340,54 @@ class ReplicaSetController:
         self._handler = LogRotator(_log_prefix(app, name)+".json", maxBytes=2**24, backupCount=16, encoding="utf-8")
         self._control = asyncio.ensure_future(asyncio.start_unix_server(self._handle_control, path=_log_prefix(self._app, self._name) + '.sock'))
 
+    if singularity_version().major < 3:
+        @staticmethod
+        def instance_cmd(verb):
+            return ['singularity', 'instance.{}'.format(verb)]
+    else:
+        @staticmethod
+        def instance_cmd(verb):
+            return ['singularity', 'instance', verb]
+
+    @classmethod
+    def _instance_running(cls, name):
+        if singularity_version().major < 3:
+            ret = subprocess.call(cls.instance_cmd('list') + [name],
+                stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            return ret == 0
+        else:
+            try:
+                instances = json.loads(subprocess.check_output(cls.instance_cmd('list') + ['--json', name]))['instances']
+            except:
+                return False
+            return len(instances) > 0
+
+    @classmethod
+    def _stop_instance(cls, name):
+        ret = subprocess.call(cls.instance_cmd('stop') + [name],
+            stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        return ret == 0
+
+    @classmethod
+    def _start_instance(cls, app, name, replica, config):
+        instance = _instance_name(app, name, replica)
+        config = copy.deepcopy(config)
+        config['services'][name] = _transform_items(config['services'][name], lambda x: _sub_replica(x, replica))
+        image_spec = singularity_command_line(name, config)
+
+        if singularity_version().major < 3:
+            if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
+                raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
+
+        log.debug('starting instance {} ({}.{}.{})'.format(instance, app, name, replica))
+        subprocess.call(cls.instance_cmd('stop') + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        subprocess.check_call(cls.instance_cmd('start') + image_spec + [instance])
+        log.info("Started instance {} ({}.{}.{})".format(instance, app, name, replica))
+        return instance, config
+
     def start_replica(self):
         replica = max(self._procs.keys(), default=0)+1
-        instance = _instance_name(self._app, self._name, replica)
-        config = copy.deepcopy(self._config)
-        config['services'][self._name] = _transform_items(self._config['services'][self._name], lambda x: _sub_replica(x, replica))
-        image_spec = singularity_command_line(self._name, config)
-        if len(os.path.basename(image_spec[-1]))+len(instance) > 32:
-            raise ValueError("image file ({}) and instance name ({}) can have at most 32 characters combined. (singularity 2.4 bug)".format(os.path.basename(image_spec[-1]), instance))
-        log.debug('starting instance {} ({}.{}.{})'.format(instance, self._app, self._name, replica))
-        subprocess.call(['singularity', 'instance.stop'] + [instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-        subprocess.check_call(['singularity', 'instance.start'] + image_spec + [instance])
-        log.info("Started instance {} ({}.{}.{})".format(instance, self._app, self._name, replica))
+        instance, config = self._start_instance(self._app, self._name, replica, self._config)
         self._procs[replica] = ReplicaRunner(self._app, self._name, replica, config, self._handler)
         return instance
 
@@ -350,6 +400,7 @@ class ReplicaSetController:
         try:
             proc = self._procs.pop(replica)
             await proc.stop()
+            self._stop_instance(proc._instance)
         except KeyError:
             log.error("No such replica {}".format(replica))
 
@@ -475,8 +526,7 @@ class ReplicaRunner:
             self._cmd += service['command']
 
         self._env = {k: str(v) for k,v in service.get('environment', {}).items()}
-        if overlayfs_is_broken:
-            _env_secrets(self._env, config)
+        _env_secrets(self._env, config)
 
         restart_policy = service.get('deploy', {}).get('restart_policy', {})
         if not restart_policy.get('condition', False) in {'on-failure', 'any', False}:
@@ -491,12 +541,9 @@ class ReplicaRunner:
         self._future = asyncio.ensure_future(self._run())
 
     async def wait(self):
-        try:
-            log.debug("waiting for future")
-            result = await self._future
-            log.debug("future complete")
-        finally:
-            subprocess.call(['singularity', 'instance.stop'] + [self._instance], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        log.debug("waiting for future")
+        result = await self._future
+        log.debug("future complete")
         log.debug("finished")
         return result
 
@@ -530,7 +577,7 @@ class ReplicaRunner:
     async def _run(self):
         ret = 0
         for _ in range(-1, self._restart_policy['max_attempts']):
-            if not _instance_running(self._instance):
+            if not ReplicaSetController._instance_running(self._instance):
                 print('{} instance is gone!'.format(self._instance), file=self._nanny)
                 ret = 1
                 break
