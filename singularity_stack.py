@@ -753,7 +753,7 @@ class ConstraintEvaluator(ast.NodeVisitor):
         return node.id
     def visit_Str(self, node):
         return node.s
-    def visit_Num(self, node):
+    def visit_Constant(self, node):
         return str(node.n)
     def visit_BinOp(self, node):
         rep = {ast.Sub: '-', ast.Add: '+'}[type(node.op)]
