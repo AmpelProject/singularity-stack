@@ -618,13 +618,16 @@ class StackCache(dict):
 
     @classmethod
     def load(cls):
-        with open(cls.cache_file, "r") as fd:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_SH)
-                stacks = yaml.safe_load(fd)
-            finally:
-                fcntl.flock(fd, fcntl.LOCK_UN)
-        return stacks
+        try:
+            with open(cls.cache_file, "r") as fd:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH)
+                    stacks = yaml.safe_load(fd)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            return stacks
+        except FileNotFoundError:
+            return {}
 
     def __init__(self):
         try:
