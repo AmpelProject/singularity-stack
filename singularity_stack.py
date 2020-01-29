@@ -66,15 +66,16 @@ def singularity_image(name):
         _, basename = name.split('/')
     if ':' in basename:
         basename, tag = basename.split(':')
-        if singularity_version().major < 3:
-            basename += '-{}.simg'.format(tag)
-        else:
-            basename += '_{}.sif'.format(tag)
 
     cwd = os.environ.get('SINGULARITY_CACHEDIR', os.getcwd())
-    image_path = os.path.join(cwd, basename)
-    if not os.path.isfile(image_path):
-        subprocess.check_call(['singularity', 'pull', 'docker://{}'.format(name)], cwd=cwd)
+    extensions = ['-{}.simg']
+    if singularity_version().major > 2:
+        extensions.append('_{}.sif')
+    for ext in extensions:
+        image_path = os.path.join(cwd, basename + ext.format(tag))
+        if os.path.isfile(image_path):
+            return image_path
+    subprocess.check_call(['singularity', 'pull', 'docker://{}'.format(name)], cwd=cwd)
     return image_path
 
 def overlayfs_is_broken():

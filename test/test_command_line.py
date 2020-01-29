@@ -6,7 +6,7 @@ import os
 import copy
 import shutil
 import subprocess
-from singularity_stack import singularity_command_line
+from singularity_stack import singularity_command_line, singularity_version
 
 @pytest.fixture
 def config():
@@ -112,3 +112,20 @@ def test_parse_volume():
     assert _parse_volume(passthrough) == passthrough
     with pytest.raises(TypeError):
         _parse_volume(['thing'])
+
+@pytest.fixture
+def restore_env():
+    prev = dict(os.environ)
+    yield
+    os.environ.clear()
+    os.environ.update(**prev)
+
+def test_image_path(tmpdir_factory, restore_env):
+    from singularity_stack import singularity_image
+    
+    tmp = tmpdir_factory.mktemp("singularity-cachedir")
+    os.environ['SINGULARITY_CACHEDIR'] = str(tmp)
+    image_path = tmp/"alpine-3.6.simg"
+    with open(image_path, 'w'):
+        pass
+    assert singularity_image('alpine:3.6') == image_path
