@@ -1058,8 +1058,12 @@ _ppid_map.ppids = None
 
 def _service_pids(root_pid):
     """Gather PIDs that are descendants of root_pid, but whose direct parent is action-suid. These are processes started with `singularity run`."""
+    if singularity_version().major > 2:
+        action_suid = b'Singularity runtime parent'
+    else:
+        action_suid = b'action-suid'
     def _gather_leaves(root_pid, parent_map, child_map):
-        if _executable(parent_map[root_pid]) == b'action-suid':
+        if _executable(parent_map[root_pid]) == action_suid:
             return [root_pid]
         elif root_pid in child_map:
             return sum([_gather_leaves(c, parent_map, child_map) for c in child_map[root_pid]], [])
