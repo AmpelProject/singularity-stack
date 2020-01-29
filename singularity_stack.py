@@ -62,6 +62,7 @@ def singularity_image(name):
     :param name: an image name, of the form organization/name:tag
     """
     basename = name
+    tag = 'latest'
     if '/' in name:
         _, basename = name.split('/')
     if ':' in basename:
